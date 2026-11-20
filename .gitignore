@@ -9,3 +9,10 @@ build/
 *.tmp
 .DS_Store
 Thumbs.db
+.venv/
+__pycache__/
+.pytest_cache/
+node_modules/
+dist/
+.npm-cache/
+.browser-cache/
