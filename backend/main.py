@@ -56,6 +56,23 @@ class ChatRoom:
                         pass
                 events = [self.users_event(), *[self.notice(p, "离开") for p in removed]]
 
+    async def deliver(self, recipients, event):
+        """Called under lock. Send one event to selected peers, cleaning up failures."""
+        failed = [
+            peer for peer in recipients if not await self.send(peer.socket, event)
+        ]
+        removed = [self.peers.pop(peer.id) for peer in failed if peer.id in self.peers]
+        if not removed:
+            return
+        for peer in removed:
+            try:
+                await asyncio.wait_for(peer.socket.close(), timeout=3)
+            except Exception:
+                pass
+        await self.publish(
+            [self.users_event(), *[self.notice(peer, "离开") for peer in removed]]
+        )
+
     def users_event(self):
         return {"type": "users", "users": [p.public() for p in self.peers.values()]}
 
@@ -122,6 +139,29 @@ def create_app():
                             await room.publish([{"type": "chat", "id": str(uuid4()),
                                                  "sender": peer.public(), "text": text.strip(),
                                                  "time": timestamp()}])
+                    elif kind == "private":
+                        if not peer or peer.id not in room.peers:
+                            raise ValueError("请先进入聊天室")
+                        text = event.get("text")
+                        if not isinstance(text, str) or not 1 <= len(text.strip()) <= 2000:
+                            raise ValueError("消息须为1～2000个字符")
+                        target_id = event.get("to")
+                        if not isinstance(target_id, str) or not target_id:
+                            raise ValueError("请选择私聊对象")
+                        async with room.lock:
+                            target = room.peers.get(target_id)
+                            if target is None:
+                                raise ValueError("对方不在线，无法发送私聊")
+                            if target.id == peer.id:
+                                raise ValueError("不能给自己发送私聊")
+                            await room.deliver([peer, target], {
+                                "type": "private",
+                                "id": str(uuid4()),
+                                "sender": peer.public(),
+                                "recipient": target.public(),
+                                "text": text.strip(),
+                                "time": timestamp(),
+                            })
                     else:
                         raise ValueError("不支持的事件类型")
                 except (ValueError, TypeError) as exc:
