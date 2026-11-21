@@ -230,9 +230,44 @@ p {
 .user-list li {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin: 16px 0;
+  margin: 6px 0;
   font-size: 12px;
+  border-radius: 10px;
+}
+.user-list li.active {
+  background: #dee9da;
+}
+.member-button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  background: none;
+  border-radius: 10px;
+  color: inherit;
+  font-size: 12px;
+  text-align: left;
+}
+.member-button:hover:not(:disabled) {
+  background: #e3ecdf;
+}
+.member-button:disabled {
+  opacity: 1;
+  cursor: default;
+}
+.member-button .member-name {
+  flex: 1;
+}
+.unread-badge {
+  background: #35765a;
+  color: #fff;
+  border-radius: 999px;
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 1.5;
+  flex-shrink: 0;
 }
 .avatar {
   display: grid;
@@ -284,6 +319,24 @@ p {
 .conversation-header h2 {
   margin: 6px 0 0;
   font-size: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-title {
+  min-width: 0;
+}
+.back-button {
+  display: block;
+  padding: 0;
+  margin-bottom: 8px;
+}
+.offline-hint {
+  margin-left: 8px;
+  font-size: 10px;
+  font-weight: 400;
+  color: #b07a3c;
+  white-space: nowrap;
 }
 .conversation-header .eyebrow {
   font-size: 8px;
@@ -531,6 +584,12 @@ p {
   }
   .conversation-header {
     padding: 14px 16px;
+  }
+  .conversation-title h2 {
+    font-size: 16px;
+  }
+  .back-button {
+    margin-bottom: 4px;
   }
   .session {
     gap: 8px;

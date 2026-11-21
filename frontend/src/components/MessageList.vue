@@ -1,6 +1,6 @@
 <script setup>
 import { ref, watch, nextTick } from "vue";
-const props = defineProps({ messages: Array, selfId: String });
+const props = defineProps({ messages: Array, selfId: String, privatePeer: Object });
 const list = ref(null);
 function time(value) {
   return new Date(value).toLocaleTimeString("zh-CN", {
@@ -31,9 +31,19 @@ watch(
     aria-live="polite"
   >
     <div class="channel-intro">
-      <span>#</span>
-      <h3>欢迎来到公共聊天室</h3>
-      <p>这是你们本次交流的开始。</p>
+      <span>{{ privatePeer ? "@" : "#" }}</span>
+      <h3>
+        {{
+          privatePeer ? `与 ${privatePeer.nickname} 的私聊` : "欢迎来到公共聊天室"
+        }}
+      </h3>
+      <p>
+        {{
+          privatePeer
+            ? "只有你和对方能看到这里的消息。"
+            : "这是你们本次交流的开始。"
+        }}
+      </p>
     </div>
     <template
       v-for="(message, index) in messages"
