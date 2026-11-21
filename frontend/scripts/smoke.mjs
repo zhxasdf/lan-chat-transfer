@@ -74,7 +74,8 @@ async function enter(page, nickname) {
 }
 try {
   await start();
-  browser = await chromium.launch();
+  // 使用完整 Chromium 的无头模式，避免额外依赖 headless shell 下载。
+  browser = await chromium.launch({ channel: "chromium" });
   const context = await browser.newContext({
     viewport: { width: 1366, height: 900 },
   });
@@ -117,6 +118,37 @@ try {
     "多行消息",
   );
   assert.equal(await a.evaluate(() => window.testInjected), undefined);
+  // 私聊：张三点李四发起，只有张三和李四能看到。
+  await a.getByRole("button", { name: "与 李四 私聊" }).click();
+  await until(
+    async () =>
+      (await a.getByRole("heading", { name: "与 李四 私聊" }).count()) === 1,
+    "进入私聊视图",
+  );
+  assert.equal(await a.locator(".bubble").count(), 0);
+  await a.getByLabel("消息内容").fill("只给李四看的私聊");
+  await a.getByLabel("消息内容").press("Enter");
+  await until(
+    async () => (await a.locator(".bubble").count()) === 1,
+    "私聊已发出",
+  );
+  await until(
+    async () => (await b.locator(".unread-badge").count()) === 1,
+    "李四收到未读提示",
+  );
+  assert.equal(await c.locator(".bubble").count(), 3);
+  await b.getByRole("button", { name: "与 张三 私聊" }).click();
+  await until(
+    async () => (await b.locator(".bubble").count()) === 1,
+    "李四收到私聊",
+  );
+  assert.match(await b.locator(".bubble").innerText(), /只给李四看的私聊/);
+  assert.equal(await c.locator(".bubble").count(), 3);
+  await b.getByRole("button", { name: "公共频道" }).click();
+  await until(
+    async () => (await b.locator(".bubble").count()) === 3,
+    "切回群聊",
+  );
   await c.setViewportSize({ width: 390, height: 844 });
   assert.equal(
     await c.evaluate(
@@ -157,7 +189,7 @@ try {
   assert.equal(await a.locator(".bubble").count(), 0);
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: 三标签页群聊、重复昵称、退出清理、文本安全、多行输入、移动端布局、服务中断和重新进入。",
+    "PASS: 三标签页群聊、一对一私聊可见性与未读提示、重复昵称、退出清理、文本安全、多行输入、移动端布局、服务中断和重新进入。",
   );
 } finally {
   await browser?.close();
