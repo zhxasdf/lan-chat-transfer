@@ -130,3 +130,105 @@ def test_failed_recipient_does_not_block_others():
         await room.remove(bad)
         assert len(room.peers) == 1
     asyncio.run(scenario())
+
+
+def test_private_chat_reaches_only_sender_and_recipient(client):
+    with client.websocket_connect("/ws") as a:
+        alice, _ = join(a, "张三")
+        with client.websocket_connect("/ws") as b:
+            bob, users = join(b, "李四")
+            assert len(users) == 2
+            a.receive_json()
+            a.receive_json()
+            with client.websocket_connect("/ws") as c:
+                _, users = join(c, "王五")
+                assert len(users) == 3
+                for ws in (a, b):
+                    ws.receive_json()
+                    ws.receive_json()
+                a.send_json({"type": "private", "to": bob["id"], "text": "只给李四"})
+                event_a = a.receive_json()
+                assert event_a == b.receive_json()
+                assert event_a["type"] == "private"
+                assert event_a["sender"] == alice
+                assert event_a["recipient"] == bob
+                assert event_a["text"] == "只给李四"
+                assert event_a["id"] and event_a["time"]
+                # 王五没有收到这条私聊：它读到的下一条事件必须是随后的群聊。
+                a.send_json({"type": "chat", "text": "公开消息"})
+                for ws in (a, b, c):
+                    assert ws.receive_json()["type"] == "chat"
+
+
+def test_private_chat_rejects_bad_targets(client):
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "private", "to": "someone", "text": "还没进入"})
+        assert "请先进入聊天室" in ws.receive_json()["message"]
+        me, _ = join(ws, "张三")
+        for target in ["", None, "missing-user", me["id"]]:
+            ws.send_json({"type": "private", "to": target, "text": "你好"})
+            assert ws.receive_json()["type"] == "error"
+        ws.send_json({"type": "private", "text": "缺少目标"})
+        assert ws.receive_json()["type"] == "error"
+        ws.send_json({"type": "chat", "text": "仍能聊天"})
+        assert ws.receive_json()["text"] == "仍能聊天"
+
+
+@pytest.mark.parametrize("text", ["", "  ", "x" * 2001, 123, None])
+def test_private_chat_rejects_invalid_text(client, text):
+    with client.websocket_connect("/ws") as a:
+        alice, _ = join(a, "张三")
+        with client.websocket_connect("/ws") as b:
+            bob, _ = join(b, "李四")
+            a.receive_json()
+            a.receive_json()
+            a.send_json({"type": "private", "to": bob["id"], "text": text})
+            assert a.receive_json()["type"] == "error"
+            b.send_json({"type": "private", "to": alice["id"], "text": "正常私聊"})
+            assert b.receive_json()["type"] == "private"
+            assert a.receive_json()["text"] == "正常私聊"
+
+
+def test_private_chat_boundary_text(client):
+    with client.websocket_connect("/ws") as a:
+        _, _ = join(a, "张三")
+        with client.websocket_connect("/ws") as b:
+            bob, _ = join(b, "李四")
+            a.receive_json()
+            a.receive_json()
+            text = "🙂" * 2000
+            a.send_json({"type": "private", "to": bob["id"], "text": text})
+            assert a.receive_json()["text"] == text
+            assert b.receive_json()["text"] == text
+
+
+def test_private_chat_to_offline_user(client):
+    with client.websocket_connect("/ws") as a:
+        _, _ = join(a, "张三")
+        with client.websocket_connect("/ws") as b:
+            bob, _ = join(b, "李四")
+            a.receive_json()
+            a.receive_json()
+        assert len(a.receive_json()["users"]) == 1
+        a.receive_json()
+        a.send_json({"type": "private", "to": bob["id"], "text": "还在吗"})
+        assert "对方不在线" in a.receive_json()["message"]
+        a.send_json({"type": "chat", "text": "仍在群聊"})
+        assert a.receive_json()["text"] == "仍在群聊"
+
+
+def test_private_delivery_cleans_failed_recipient():
+    async def scenario():
+        room = ChatRoom()
+        sender = Peer(AsyncMock(), "发送者")
+        target = Peer(AsyncMock(), "失效目标")
+        target.socket.send_json.side_effect = RuntimeError("closed")
+        room.peers = {p.id: p for p in (sender, target)}
+        async with room.lock:
+            await room.deliver([sender, target], {"type": "private", "text": "你好"})
+        assert list(room.peers) == [sender.id]
+        events = [call.args[0] for call in sender.socket.send_json.call_args_list]
+        assert events[0] == {"type": "private", "text": "你好"}
+        assert events[1]["users"] == [sender.public()]
+        assert "失效目标" in events[2]["text"]
+    asyncio.run(scenario())

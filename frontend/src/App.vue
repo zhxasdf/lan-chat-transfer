@@ -1,11 +1,24 @@
 <script setup>
-import { ref } from "vue";
+import { ref, computed } from "vue";
 import { useChat } from "./useChat";
 import MessageList from "./components/MessageList.vue";
 import UserList from "./components/UserList.vue";
 
-const { status, user, users, messages, error, join, disconnect, send } =
-  useChat();
+const {
+  status,
+  user,
+  users,
+  messages,
+  error,
+  activePeer,
+  unread,
+  join,
+  disconnect,
+  send,
+  sendPrivate,
+  openPrivate,
+  closePrivate,
+} = useChat();
 const nickname = ref(""),
   draft = ref(""),
   showUsers = ref(false);
@@ -15,8 +28,28 @@ const labels = {
   connected: "已连接",
   disconnected: "连接已断开",
 };
+const visibleMessages = computed(() => {
+  if (!user.value) return [];
+  return messages.value.filter((message) => {
+    if (!activePeer.value) return message.type !== "private";
+    if (message.type !== "private") return false;
+    const peer =
+      message.sender.id === user.value.id
+        ? message.recipient
+        : message.sender;
+    return peer.id === activePeer.value.id;
+  });
+});
+const peerOnline = computed(
+  () =>
+    !activePeer.value ||
+    users.value.some((person) => person.id === activePeer.value.id),
+);
 function submit() {
-  if (send(draft.value)) draft.value = "";
+  const accepted = activePeer.value
+    ? sendPrivate(draft.value)
+    : send(draft.value);
+  if (accepted) draft.value = "";
 }
 function keydown(event) {
   if (
@@ -28,6 +61,11 @@ function keydown(event) {
     event.preventDefault();
     submit();
   }
+}
+function selectPerson(person) {
+  if (!person || person.id === user.value.id) return;
+  openPrivate(person);
+  showUsers.value = false;
 }
 function leave() {
   disconnect();
@@ -43,7 +81,7 @@ function leave() {
         <strong>LAN Chat</strong
         ><span class="brand-caption">让沟通发生在身边</span>
       </div>
-      <span class="version">局域网聊天室 · 01</span>
+      <span class="version">局域网聊天室 · 02</span>
     </header>
     <section v-if="!user" class="entry">
       <div class="entry-copy">
@@ -51,7 +89,7 @@ function leave() {
         <h1>同一个网络，<br />同一个聊天室。</h1>
         <p>选一个昵称，和身边的人聊起来。<br />无需注册，打开网页即可加入。</p>
         <div class="feature-tags">
-          <span>实时群聊</span><span>在线成员</span><span>多端访问</span>
+          <span>实时群聊</span><span>一对一私聊</span><span>在线成员</span>
         </div>
       </div>
       <form class="join-card" @submit.prevent="join(nickname)">
@@ -86,16 +124,36 @@ function leave() {
         <button class="members-toggle" @click="showUsers = !showUsers">
           在线成员 · {{ users.length }}
           {{ showUsers ? "收起" : "展开" }}</button
-        ><UserList :users="users" :self-id="user.id" />
+        ><UserList
+          :users="users"
+          :self-id="user.id"
+          :active-id="activePeer ? activePeer.id : null"
+          :unread="unread"
+          @select="selectPerson"
+        />
         <div class="sidebar-note">
-          消息仅在当前会话展示。<br />请友善交流，尊重彼此。
+          点击在线成员可发起私聊。<br />消息仅在当前会话展示。
         </div>
       </aside>
       <div class="conversation">
         <div class="conversation-header">
-          <div>
-            <span class="eyebrow">PUBLIC CHANNEL</span>
-            <h2>一起聊聊</h2>
+          <div class="conversation-title">
+            <button
+              v-if="activePeer"
+              class="text-button back-button"
+              @click="closePrivate"
+            >
+              ← 公共频道
+            </button>
+            <span class="eyebrow">{{
+              activePeer ? "PRIVATE CHAT" : "PUBLIC CHANNEL"
+            }}</span>
+            <h2>
+              {{ activePeer ? `与 ${activePeer.nickname} 私聊` : "一起聊聊" }}
+              <span v-if="activePeer && !peerOnline" class="offline-hint"
+                >对方已离线</span
+              >
+            </h2>
           </div>
           <div class="session">
             <span class="connection" :class="status"
@@ -104,7 +162,11 @@ function leave() {
             ><button class="text-button" @click="leave">退出</button>
           </div>
         </div>
-        <MessageList :messages="messages" :self-id="user.id" />
+        <MessageList
+          :messages="visibleMessages"
+          :self-id="user.id"
+          :private-peer="activePeer"
+        />
         <div
           v-if="status === 'disconnected'"
           class="disconnect-banner"
@@ -120,12 +182,20 @@ function leave() {
           ><textarea
             id="message"
             v-model="draft"
-            placeholder="说点什么，让交流开始…"
+            :placeholder="
+              activePeer
+                ? `私聊 ${activePeer.nickname}，只有对方能看到…`
+                : '说点什么，让交流开始…'
+            "
             :disabled="status !== 'connected'"
             @keydown="keydown"
           ></textarea>
           <div class="composer-bottom">
-            <span>Enter 发送 · Shift + Enter 换行</span
+            <span>{{
+              activePeer
+                ? "Enter 发送 · 仅对方可见"
+                : "Enter 发送 · Shift + Enter 换行"
+            }}</span
             ><button
               class="primary"
               :disabled="status !== 'connected' || !draft.trim()"
