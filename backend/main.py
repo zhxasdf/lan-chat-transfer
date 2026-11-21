@@ -1,14 +1,20 @@
 """Single-process, in-memory chat server."""
 import asyncio
 import json
+import secrets
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
+import anyio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+from backend.files import FileStore, MAX_FILE_SIZE, STORAGE_LIMIT, router as files_router
 
 
 def timestamp():
@@ -20,6 +26,7 @@ class Peer:
     socket: WebSocket
     nickname: str
     id: str = field(default_factory=lambda: str(uuid4()))
+    token: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
 
     def public(self):
         return {"id": self.id, "nickname": self.nickname}
@@ -85,10 +92,18 @@ class ChatRoom:
                 await self.publish([self.users_event(), self.notice(peer, "离开")])
 
 
-def create_app():
-    app = FastAPI(title="LAN Chat Transfer")
+def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT):
+    @asynccontextmanager
+    async def lifespan(app):
+        # Only our own uniquely-created temporary directory is ever cleaned up.
+        with TemporaryDirectory(prefix="lan-chat-transfer-") as directory:
+            app.state.files = FileStore(Path(directory), file_limit, storage_limit)
+            yield
+
+    app = FastAPI(title="LAN Chat Transfer", lifespan=lifespan)
     room = ChatRoom()
     app.state.room = room
+    app.include_router(files_router)
 
     @app.get("/api/health")
     async def health():
@@ -125,7 +140,7 @@ def create_app():
                                 raise ValueError("昵称已被使用，请换一个")
                             peer = Peer(socket, name)
                             room.peers[peer.id] = peer
-                            if not await room.send(socket, {"type": "welcome", "user": peer.public()}):
+                            if not await room.send(socket, {"type": "welcome", "user": peer.public(), "token": peer.token}):
                                 room.peers.pop(peer.id, None)
                                 break
                             await room.publish([room.users_event(), room.notice(peer, "进入")])
@@ -171,7 +186,10 @@ def create_app():
             pass
         finally:
             if peer:
-                await room.remove(peer)
+                # Test clients and server shutdown may cancel the connection task.
+                # Finish removing it and notifying other peers even in that scope.
+                with anyio.CancelScope(shield=True):
+                    await room.remove(peer)
 
     dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
     if (dist / "assets").is_dir():

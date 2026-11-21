@@ -3,6 +3,7 @@ import { ref, computed } from "vue";
 import { useChat } from "./useChat";
 import MessageList from "./components/MessageList.vue";
 import UserList from "./components/UserList.vue";
+import { formatSize } from "./fileTransfer";
 
 const {
   status,
@@ -12,6 +13,11 @@ const {
   error,
   activePeer,
   unread,
+  upload,
+  downloading,
+  sendFile,
+  cancelFileUpload,
+  saveFile,
   join,
   disconnect,
   send,
@@ -22,6 +28,12 @@ const {
 const nickname = ref(""),
   draft = ref(""),
   showUsers = ref(false);
+const fileInput = ref(null);
+function selectFile(event) {
+  const file = event.target.files?.[0];
+  event.target.value = "";
+  if (file) sendFile(file);
+}
 const labels = {
   idle: "未连接",
   connecting: "连接中",
@@ -31,12 +43,10 @@ const labels = {
 const visibleMessages = computed(() => {
   if (!user.value) return [];
   return messages.value.filter((message) => {
-    if (!activePeer.value) return message.type !== "private";
-    if (message.type !== "private") return false;
+    if (!activePeer.value) return !message.recipient;
+    if (!message.recipient) return false;
     const peer =
-      message.sender.id === user.value.id
-        ? message.recipient
-        : message.sender;
+      message.sender.id === user.value.id ? message.recipient : message.sender;
     return peer.id === activePeer.value.id;
   });
 });
@@ -81,7 +91,7 @@ function leave() {
         <strong>LAN Chat</strong
         ><span class="brand-caption">让沟通发生在身边</span>
       </div>
-      <span class="version">局域网聊天室 · 02</span>
+      <span class="version">局域网聊天室 · 03</span>
     </header>
     <section v-if="!user" class="entry">
       <div class="entry-copy">
@@ -89,7 +99,7 @@ function leave() {
         <h1>同一个网络，<br />同一个聊天室。</h1>
         <p>选一个昵称，和身边的人聊起来。<br />无需注册，打开网页即可加入。</p>
         <div class="feature-tags">
-          <span>实时群聊</span><span>一对一私聊</span><span>在线成员</span>
+          <span>实时群聊</span><span>一对一私聊</span><span>文件传输</span>
         </div>
       </div>
       <form class="join-card" @submit.prevent="join(nickname)">
@@ -166,6 +176,9 @@ function leave() {
           :messages="visibleMessages"
           :self-id="user.id"
           :private-peer="activePeer"
+          :downloading="downloading"
+          :connected="status === 'connected'"
+          @download="saveFile"
         />
         <div
           v-if="status === 'disconnected'"
@@ -178,6 +191,22 @@ function leave() {
         </div>
         <form class="composer" @submit.prevent="submit">
           <p v-if="error" class="error" role="alert">{{ error }}</p>
+          <div v-if="upload" class="upload-status" role="status">
+            <span class="upload-caption"
+              >{{ upload.name }} → {{ upload.target }}</span
+            >
+            <progress
+              :value="upload.progress"
+              max="100"
+              aria-label="上传进度"
+            ></progress>
+            <span>{{
+              upload.progress === 100 ? "处理中…" : `${upload.progress}%`
+            }}</span>
+            <button type="button" class="text-button" @click="cancelFileUpload">
+              取消上传
+            </button>
+          </div>
           <label class="sr-only" for="message">消息内容</label
           ><textarea
             id="message"
@@ -191,6 +220,26 @@ function leave() {
             @keydown="keydown"
           ></textarea>
           <div class="composer-bottom">
+            <div class="file-actions">
+              <input
+                ref="fileInput"
+                type="file"
+                class="sr-only"
+                aria-label="选择文件"
+                @change="selectFile"
+              />
+              <button
+                type="button"
+                class="file-select"
+                :disabled="status !== 'connected' || !!upload || !peerOnline"
+                @click="fileInput.click()"
+              >
+                ＋ 发送文件
+              </button>
+              <span class="file-limit"
+                >≤ {{ formatSize(20 * 1024 * 1024) }}</span
+              >
+            </div>
             <span>{{
               activePeer
                 ? "Enter 发送 · 仅对方可见"
