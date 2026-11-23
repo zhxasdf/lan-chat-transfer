@@ -94,4 +94,4 @@ Set-Location ..
 - `frontend/src/useChat.js`：连接与消息状态；`App.vue`和`components/`：页面与组件。
 - [交接说明](交接说明.md)：已完成与未完成的工作、测试与待验收事项、必要通信约定、扩展入口和接手流程，与README并列放在项目根目录。
 
-两人按完整功能轮流负责前后端，另一人运行验证并评审PR；各自使用真实账号提交。首轮群聊和第二轮私聊分别经PR #1、#2合并。本轮文件传输在`feature/file-transfer`开发，尚未提交、推送或发起PR；不能将自动测试视为已完成队友评审。
+两人按完整功能轮流负责前后端，另一人运行验证并评审PR；各自使用真实账号提交。首轮群聊和第二轮私聊分别经PR #1、#2合并。本轮文件传输已提交并推送至`feature/file-transfer`，已创建[PR #3](https://github.com/zhxasdf/lan-chat-transfer/pull/3)，待评审和合并；计划由fish-salt-jpg评审，需在PR的Reviewers中正式请求对方评审。自动测试或文档中的分工不代表已发出评审请求或评审已通过。
