@@ -12,6 +12,9 @@ Thumbs.db
 .venv/
 __pycache__/
 .pytest_cache/
+backend/data/
+.test-tmp/
+pytest-of-*/
 node_modules/
 dist/
 .npm-cache/

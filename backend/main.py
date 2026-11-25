@@ -1,7 +1,7 @@
-"""Single-process, in-memory chat server."""
+"""Single-process chat server with SQLite accounts and in-memory connections."""
 import asyncio
 import json
-import secrets
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -10,10 +10,11 @@ from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 import anyio
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from backend.db import AuthError, Database
 from backend.files import FileStore, MAX_FILE_SIZE, STORAGE_LIMIT, router as files_router
 
 
@@ -21,15 +22,29 @@ def timestamp():
     return datetime.now(timezone.utc).isoformat()
 
 
+def bearer_token(request: Request):
+    authorization = request.headers.get("authorization", "")
+    kind, _, token = authorization.partition(" ")
+    if kind.lower() != "bearer" or not token:
+        return None
+    return token
+
+
 @dataclass
 class Peer:
     socket: WebSocket
-    nickname: str
+    user_id: str
+    username: str
+    display_name: str
     id: str = field(default_factory=lambda: str(uuid4()))
-    token: str = field(default_factory=lambda: secrets.token_urlsafe(32), repr=False)
 
     def public(self):
-        return {"id": self.id, "nickname": self.nickname}
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "username": self.username,
+            "nickname": self.display_name,
+        }
 
 
 class ChatRoom:
@@ -84,7 +99,11 @@ class ChatRoom:
         return {"type": "users", "users": [p.public() for p in self.peers.values()]}
 
     def notice(self, peer, action):
-        return {"type": "notice", "text": f"{peer.nickname} {action}了聊天室", "time": timestamp()}
+        return {
+            "type": "notice",
+            "text": f"{peer.display_name} {action}了聊天室",
+            "time": timestamp(),
+        }
 
     async def remove(self, peer):
         async with self.lock:
@@ -92,11 +111,21 @@ class ChatRoom:
                 await self.publish([self.users_event(), self.notice(peer, "离开")])
 
 
-def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT):
+def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path=None):
+    if db_path is None:
+        db_path = os.environ.get("LAN_CHAT_DB")
+    database_path = (
+        Path(db_path)
+        if db_path
+        else Path(__file__).resolve().parent / "data" / "chat.db"
+    )
+
     @asynccontextmanager
     async def lifespan(app):
-        # Only our own uniquely-created temporary directory is ever cleaned up.
-        with TemporaryDirectory(prefix="lan-chat-transfer-") as directory:
+        app.state.db = Database(database_path)
+        with TemporaryDirectory(
+            prefix="lan-chat-transfer-", dir=os.environ.get("LAN_CHAT_TMP")
+        ) as directory:
             app.state.files = FileStore(Path(directory), file_limit, storage_limit)
             yield
 
@@ -108,6 +137,50 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT):
     @app.get("/api/health")
     async def health():
         return {"status": "ok"}
+
+    async def current_account(request: Request):
+        token = bearer_token(request)
+        if token is None:
+            raise HTTPException(401, "登录凭证无效，请重新登录")
+        account = await asyncio.to_thread(app.state.db.session_user, token)
+        if account is None:
+            raise HTTPException(401, "登录已过期，请重新登录")
+        return account
+
+    @app.post("/api/auth/register", status_code=201)
+    async def register(payload: dict):
+        try:
+            user = await asyncio.to_thread(
+                app.state.db.create_user,
+                payload.get("username"),
+                payload.get("password"),
+            )
+        except AuthError as exc:
+            raise HTTPException(400, str(exc)) from None
+        return {"user": user}
+
+    @app.post("/api/auth/login")
+    async def login(payload: dict):
+        try:
+            user = await asyncio.to_thread(
+                app.state.db.authenticate,
+                payload.get("username"),
+                payload.get("password"),
+            )
+        except AuthError as exc:
+            raise HTTPException(401, str(exc)) from None
+        token = await asyncio.to_thread(app.state.db.create_session, user["id"])
+        return {"user": user, "token": token}
+
+    @app.post("/api/auth/logout", status_code=204)
+    async def logout(request: Request):
+        token = bearer_token(request)
+        if token is not None:
+            await asyncio.to_thread(app.state.db.delete_session, token)
+
+    @app.get("/api/auth/me")
+    async def me(request: Request):
+        return {"user": await current_account(request)}
 
     @app.websocket("/ws")
     async def websocket(socket: WebSocket):
@@ -128,35 +201,49 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT):
                     if not isinstance(event, dict):
                         raise ValueError("事件必须是JSON对象")
                     kind = event.get("type")
-                    if kind == "join":
+                    if kind == "auth":
                         if peer:
-                            raise ValueError("已经进入聊天室")
-                        name = event.get("nickname")
-                        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 20:
-                            raise ValueError("昵称须为1～20个字符")
-                        name = name.strip()
+                            raise ValueError("已经登录")
+                        token = event.get("token")
+                        if not isinstance(token, str) or not token:
+                            raise ValueError("登录凭证无效，请重新登录")
+                        account = await asyncio.to_thread(
+                            app.state.db.session_user, token
+                        )
+                        if account is None:
+                            raise ValueError("登录已过期，请重新登录")
                         async with room.lock:
-                            if any(p.nickname == name for p in room.peers.values()):
-                                raise ValueError("昵称已被使用，请换一个")
-                            peer = Peer(socket, name)
+                            peer = Peer(
+                                socket,
+                                account["id"],
+                                account["username"],
+                                account["display_name"],
+                            )
                             room.peers[peer.id] = peer
-                            if not await room.send(socket, {"type": "welcome", "user": peer.public(), "token": peer.token}):
+                            welcome = {"type": "welcome", "user": peer.public()}
+                            if not await room.send(socket, welcome):
                                 room.peers.pop(peer.id, None)
                                 break
-                            await room.publish([room.users_event(), room.notice(peer, "进入")])
+                            await room.publish(
+                                [room.users_event(), room.notice(peer, "进入")]
+                            )
                     elif kind == "chat":
                         if not peer or peer.id not in room.peers:
-                            raise ValueError("请先进入聊天室")
+                            raise ValueError("请先登录")
                         text = event.get("text")
                         if not isinstance(text, str) or not 1 <= len(text.strip()) <= 2000:
                             raise ValueError("消息须为1～2000个字符")
                         async with room.lock:
-                            await room.publish([{"type": "chat", "id": str(uuid4()),
-                                                 "sender": peer.public(), "text": text.strip(),
-                                                 "time": timestamp()}])
+                            await room.publish([{
+                                "type": "chat",
+                                "id": str(uuid4()),
+                                "sender": peer.public(),
+                                "text": text.strip(),
+                                "time": timestamp(),
+                            }])
                     elif kind == "private":
                         if not peer or peer.id not in room.peers:
-                            raise ValueError("请先进入聊天室")
+                            raise ValueError("请先登录")
                         text = event.get("text")
                         if not isinstance(text, str) or not 1 <= len(text.strip()) <= 2000:
                             raise ValueError("消息须为1～2000个字符")
@@ -199,7 +286,9 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT):
     async def index():
         if (dist / "index.html").is_file():
             return FileResponse(dist / "index.html")
-        return JSONResponse({"message": "请先构建frontend，或访问Vite开发服务器"}, status_code=503)
+        return JSONResponse(
+            {"message": "请先构建frontend，或访问Vite开发服务器"}, status_code=503
+        )
 
     return app
 

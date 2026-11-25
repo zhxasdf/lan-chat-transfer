@@ -5,25 +5,41 @@ import anyio
 import pytest
 from fastapi.testclient import TestClient
 
+from backend.db import Database
 from backend.files import MAX_FILE_SIZE
 from backend.main import Peer, create_app
 
+PASSWORD = "password123"
+
 
 @pytest.fixture
-def client():
-    with TestClient(create_app()) as value:
+def client(tmp_path):
+    with TestClient(create_app(db_path=tmp_path / "chat.db")) as value:
         yield value
 
 
-def join(ws, name):
-    ws.send_json({"type": "join", "nickname": name})
+def login(client, name, register=True):
+    if register:
+        response = client.post(
+            "/api/auth/register", json={"username": name, "password": PASSWORD}
+        )
+        assert response.status_code == 201, response.text
+    data = client.post(
+        "/api/auth/login", json={"username": name, "password": PASSWORD}
+    ).json()
+    return data["user"], data["token"]
+
+
+def enter(client, ws, name, register=True):
+    user, token = login(client, name, register)
+    ws.send_json({"type": "auth", "token": token})
     welcome = ws.receive_json()
     users = ws.receive_json()
     ws.receive_json()
     assert "token" not in json.dumps(users)
     assert "token" not in welcome["user"]
-    return welcome["user"], {"Authorization": f"Bearer {welcome['token']}",
-                              "Content-Type": "application/octet-stream"}
+    return welcome["user"], {"Authorization": f"Bearer {token}",
+                             "Content-Type": "application/octet-stream"}
 
 
 def drain_join(*sockets):
@@ -47,8 +63,8 @@ def assert_clean(client):
 
 def test_public_file_broadcast_download_and_same_names(client):
     with client.websocket_connect("/ws") as a, client.websocket_connect("/ws") as b:
-        alice, ah = join(a, "张三")
-        _, bh = join(b, "李四")
+        alice, ah = enter(client, a, "张三三")
+        _, bh = enter(client, b, "李四四")
         drain_join(a)
         ids = []
         for content in (b"first", b"second", b""):
@@ -70,17 +86,17 @@ def test_public_file_broadcast_download_and_same_names(client):
             assert result.headers["content-type"] == "application/octet-stream"
         assert len(set(ids)) == 3
         with client.websocket_connect("/ws") as later:
-            _, lh = join(later, "后来加入")
+            _, lh = enter(client, later, "后来加入")
             assert client.get(f"/api/files/{ids[0]}", headers=lh).content == b"first"
 
 
 def test_private_file_permissions_and_sender_leaves(client):
     with client.websocket_connect("/ws") as b, client.websocket_connect("/ws") as c:
-        bob, bh = join(b, "李四")
-        _, ch = join(c, "王五")
+        bob, bh = enter(client, b, "李四四")
+        _, ch = enter(client, c, "王五五")
         drain_join(b)
         with client.websocket_connect("/ws") as a:
-            _, ah = join(a, "张三")
+            _, ah = enter(client, a, "张三三")
             drain_join(b, c)
             response = upload(client, ah, b"private bytes", to=bob["id"])
             assert response.status_code == 201
@@ -97,11 +113,16 @@ def test_private_file_permissions_and_sender_leaves(client):
             a.receive_json()
             b.receive_json()
         drain_join(b, c)
-        assert client.get(f"/api/files/{file_id}", headers=ah).status_code == 401
+        # Account sessions survive a dropped connection, so the sender can still download.
+        assert client.get(f"/api/files/{file_id}", headers=ah).content == b"private bytes"
         assert client.get(f"/api/files/{file_id}", headers=bh).content == b"private bytes"
-        with client.websocket_connect("/ws") as renamed:
-            _, new_headers = join(renamed, "张三")
-            assert client.get(f"/api/files/{file_id}", headers=new_headers).status_code == 403
+        with client.websocket_connect("/ws") as outsider:
+            _, oh = enter(client, outsider, "外人甲")
+            assert client.get(f"/api/files/{file_id}", headers=oh).status_code == 403
+        with client.websocket_connect("/ws") as again:
+            # A fresh connection for the same account keeps its file access.
+            _, same = enter(client, again, "张三三", register=False)
+            assert client.get(f"/api/files/{file_id}", headers=same).content == b"private bytes"
 
 
 @pytest.mark.parametrize("authorization", [None, "Bearer unknown", "Bearer", "Basic abc", "Bearer é"])
@@ -114,13 +135,13 @@ def test_missing_and_invalid_credentials(client, authorization):
 
 def test_public_id_is_not_a_credential(client):
     with client.websocket_connect("/ws") as ws:
-        user, _ = join(ws, "test")
+        user, _ = enter(client, ws, "测试员")
         assert upload(client, {"Authorization": f"Bearer {user['id']}"}).status_code == 401
 
 
 def test_invalid_targets_and_missing_file(client):
     with client.websocket_connect("/ws") as ws:
-        user, headers = join(ws, "test")
+        user, headers = enter(client, ws, "测试员")
         assert upload(client, headers, to=user["id"]).status_code == 400
         assert upload(client, headers, to="not-online").status_code == 409
         assert client.get("/api/files/not-found", headers=headers).status_code == 404
@@ -129,7 +150,7 @@ def test_invalid_targets_and_missing_file(client):
 
 def test_size_limit_and_false_length(client):
     with client.websocket_connect("/ws") as ws:
-        _, headers = join(ws, "test")
+        _, headers = enter(client, ws, "测试员")
         assert upload(client, headers, b"x" * (MAX_FILE_SIZE + 1)).status_code == 413
         # Unknown-length/chunked data must also be counted by the server.
         client.app.state.files.max_size = 8
@@ -151,7 +172,7 @@ def test_size_limit_and_false_length(client):
 ])
 def test_safe_names(client, name, expected):
     with client.websocket_connect("/ws") as ws:
-        _, headers = join(ws, "test")
+        _, headers = enter(client, ws, "测试员")
         assert upload(client, headers, name=name).status_code == 201
         event = ws.receive_json()
         assert event["file"]["name"] == expected
@@ -163,7 +184,7 @@ def test_quota_and_reservation_cleanup(client):
     store.max_size = 8
     store.limit = 10
     with client.websocket_connect("/ws") as ws:
-        user, headers = join(ws, "test")
+        user, headers = enter(client, ws, "测试员")
         store.reserve("another upload")
         assert upload(client, headers, b"x").status_code == 507
         store.uploading.clear()
@@ -172,31 +193,32 @@ def test_quota_and_reservation_cleanup(client):
         assert upload(client, headers, b"x").status_code == 507
         assert store.used == 8 and not store.uploading
         store.used = 0
-        store.reserve(user["id"])
+        store.reserve(user["user_id"])
         assert upload(client, headers, b"x").status_code == 409
         store.uploading.clear()
 
 
 def test_write_failure_cleans_partial_file(client):
     with client.websocket_connect("/ws") as ws:
-        _, headers = join(ws, "test")
+        _, headers = enter(client, ws, "测试员")
         with patch("backend.files.anyio.open_file", side_effect=OSError("disk full")):
             assert upload(client, headers).status_code == 507
         assert_clean(client)
         assert upload(client, headers).status_code == 201
 
 
-def test_shutdown_cleanup_and_restart():
-    app = create_app()
+def test_shutdown_cleanup_and_restart(tmp_path):
+    app = create_app(db_path=tmp_path / "chat.db")
     with TestClient(app) as client:
         root = app.state.files.root
         with client.websocket_connect("/ws") as ws:
-            _, headers = join(ws, "test")
+            _, headers = enter(client, ws, "测试员")
             file_id = upload(client, headers).json()["file_id"]
             assert (root / file_id).is_file()
     assert not root.exists()
-    with TestClient(create_app()) as client, client.websocket_connect("/ws") as ws:
-        _, headers = join(ws, "new run")
+    with TestClient(create_app(db_path=tmp_path / "chat.db")) as client, \
+            client.websocket_connect("/ws") as ws:
+        _, headers = enter(client, ws, "测试员", register=False)
         assert client.get(f"/api/files/{file_id}", headers=headers).status_code == 404
 
 
@@ -215,7 +237,7 @@ async def asgi_upload(app, headers, receive):
 
 def test_interrupted_upload_cleans_file(client):
     with client.websocket_connect("/ws") as ws:
-        _, headers = join(ws, "test")
+        _, headers = enter(client, ws, "测试员")
         events = iter([{"type": "http.request", "body": b"partial", "more_body": True},
                        {"type": "http.disconnect"}])
         async def receive():
@@ -226,7 +248,7 @@ def test_interrupted_upload_cleans_file(client):
 
 def test_sender_leaves_during_upload(client):
     with client.websocket_connect("/ws") as ws:
-        user, headers = join(ws, "test")
+        user, headers = enter(client, ws, "测试员")
         async def receive():
             await client.app.state.room.remove(client.app.state.room.peers[user["id"]])
             return {"type": "http.request", "body": b"complete", "more_body": False}
@@ -236,8 +258,8 @@ def test_sender_leaves_during_upload(client):
 
 def test_target_leaves_during_upload(client):
     with client.websocket_connect("/ws") as a, client.websocket_connect("/ws") as b:
-        _, headers = join(a, "sender")
-        target, _ = join(b, "target")
+        _, headers = enter(client, a, "发送者")
+        target, _ = enter(client, b, "目标者")
         drain_join(a)
         # Simulate the target disappearing while the HTTP body is being consumed.
         from starlette.requests import Request
@@ -251,14 +273,18 @@ def test_target_leaves_during_upload(client):
         assert_clean(client)
 
 
-def test_cancelled_connection_still_notifies_other_users():
+def test_cancelled_connection_still_notifies_other_users(tmp_path):
     async def scenario():
-        app = create_app()
-        observer = Peer(AsyncMock(), "observer")
+        app = create_app(db_path=tmp_path / "chat.db")
+        database = Database(tmp_path / "chat.db")
+        app.state.db = database
+        account = database.create_user("离开者", "password123")
+        token = database.create_session(account["id"])
+        observer = Peer(AsyncMock(), "user-1", "observer", "观察者")
         app.state.room.peers[observer.id] = observer
         incoming = iter([
             {"type": "websocket.connect"},
-            {"type": "websocket.receive", "text": json.dumps({"type": "join", "nickname": "leaving"})},
+            {"type": "websocket.receive", "text": json.dumps({"type": "auth", "token": token})},
         ])
         async def receive():
             try:

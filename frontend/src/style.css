@@ -138,6 +138,25 @@ p {
   border-radius: 9px;
   background: #fafbf8;
 }
+.join-card input + label {
+  margin-top: 18px;
+}
+.join-card .error {
+  margin: 16px 0 0;
+}
+.auth-alt {
+  display: block;
+  margin: 14px auto 0;
+}
+.connecting-card {
+  width: 100%;
+  max-width: 420px;
+  justify-self: center;
+}
+.connecting-card .primary {
+  width: 100%;
+  margin-top: 6px;
+}
 .hint,
 .card-foot {
   color: #8b968d;

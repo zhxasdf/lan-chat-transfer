@@ -4,8 +4,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 import net from "node:net";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 process.env.PLAYWRIGHT_BROWSERS_PATH ||= path.join(
@@ -18,10 +17,10 @@ const python =
     ? path.join(root, ".venv/Scripts/python.exe")
     : path.join(root, ".venv/bin/python");
 const url = "http://127.0.0.1:8765";
+const PASSWORD = "password123";
 let server, browser;
 let downloadDirectory;
 const errors = [];
-const identities = new Map();
 const digest = (value) => createHash("sha256").update(value).digest("hex");
 async function until(check, label) {
   const deadline = Date.now() + 10000;
@@ -58,6 +57,8 @@ async function start() {
         TMP: downloadDirectory,
         TEMP: downloadDirectory,
         TMPDIR: downloadDirectory,
+        LAN_CHAT_DB: path.join(downloadDirectory, "chat.db"),
+        LAN_CHAT_TMP: downloadDirectory,
       },
     },
   );
@@ -82,37 +83,48 @@ async function stop() {
   server.kill();
   await exited;
 }
-async function enter(page, nickname) {
+function tokenOf(page) {
+  return page.evaluate(() => localStorage.getItem("lan-chat-token"));
+}
+async function register(page, username) {
   await page.goto(url);
-  await page.getByLabel("你的昵称").fill(nickname);
-  await page.getByRole("button", { name: "进入聊天室" }).click();
+  await page.getByRole("button", { name: /还没有账号/ }).click();
+  await page.getByLabel("用户名").fill(username);
+  await page.getByLabel("密码").fill(PASSWORD);
+  await page.getByRole("button", { name: /^注册并登录/ }).click();
   await page.getByRole("button", { name: "退出", exact: true }).waitFor();
 }
+async function login(page, username) {
+  await page.goto(url);
+  await page.getByLabel("用户名").fill(username);
+  await page.getByLabel("密码").fill(PASSWORD);
+  await page.getByRole("button", { name: /^登录/ }).click();
+  await page.getByRole("button", { name: "退出", exact: true }).waitFor();
+}
+const testRoot = path.join(root, ".test-tmp");
 try {
-  // Keep files left by the deliberately killed test server inside our own directory.
-  downloadDirectory = await mkdtemp(path.join(tmpdir(), "lan-chat-test-"));
+  // Keep every test artifact inside the workspace; system TEMP is not writable here.
+  await mkdir(testRoot, { recursive: true });
+  downloadDirectory = await mkdtemp(path.join(testRoot, "lan-chat-test-"));
   await start();
   // 使用完整 Chromium 的无头模式，避免额外依赖 headless shell 下载。
   browser = await chromium.launch({ channel: "chromium" });
-  const context = await browser.newContext({
-    viewport: { width: 1366, height: 900 },
-  });
-  context.on("page", (page) => {
+  // Separate browser contexts so each tab keeps its own login session.
+  async function newPage() {
+    const context = await browser.newContext({
+      viewport: { width: 1366, height: 900 },
+    });
+    const page = await context.newPage();
     page.on("pageerror", (error) => errors.push(error.message));
-    page.on("websocket", (socket) =>
-      socket.on("framereceived", ({ payload }) => {
-        const event = JSON.parse(String(payload));
-        if (event.type === "welcome") identities.set(page, event);
-      }),
-    );
-  });
-  const a = await context.newPage(),
-    b = await context.newPage(),
-    c = await context.newPage();
-  await a.goto(url);
-  await enter(a, "张三");
-  await enter(b, "李四");
-  await enter(c, "王五");
+    return page;
+  }
+  const a = await newPage(),
+    b = await newPage(),
+    c = await newPage();
+  const api = a.context().request;
+  await register(a, "张三三");
+  await register(b, "李四四");
+  await register(c, "王五五");
   for (const page of [a, b, c])
     await until(
       async () => (await page.locator(".user-list li").count()) === 3,
@@ -142,15 +154,15 @@ try {
     "多行消息",
   );
   assert.equal(await a.evaluate(() => window.testInjected), undefined);
-  // 私聊：张三点李四发起，只有张三和李四能看到。
-  await a.getByRole("button", { name: "与 李四 私聊" }).click();
+  // 私聊：张三三点李四四发起，只有双方能看到。
+  await a.getByRole("button", { name: "与 李四四 私聊" }).click();
   await until(
     async () =>
-      (await a.getByRole("heading", { name: "与 李四 私聊" }).count()) === 1,
+      (await a.getByRole("heading", { name: "与 李四四 私聊" }).count()) === 1,
     "进入私聊视图",
   );
   assert.equal(await a.locator(".bubble").count(), 0);
-  await a.getByLabel("消息内容").fill("只给李四看的私聊");
+  await a.getByLabel("消息内容").fill("只给李四四看的私聊");
   await a.getByLabel("消息内容").press("Enter");
   await until(
     async () => (await a.locator(".bubble").count()) === 1,
@@ -158,15 +170,15 @@ try {
   );
   await until(
     async () => (await b.locator(".unread-badge").count()) === 1,
-    "李四收到未读提示",
+    "李四四收到未读提示",
   );
   assert.equal(await c.locator(".bubble").count(), 3);
-  await b.getByRole("button", { name: "与 张三 私聊" }).click();
+  await b.getByRole("button", { name: "与 张三三 私聊" }).click();
   await until(
     async () => (await b.locator(".bubble").count()) === 1,
-    "李四收到私聊",
+    "李四四收到私聊",
   );
-  assert.match(await b.locator(".bubble").innerText(), /只给李四看的私聊/);
+  assert.match(await b.locator(".bubble").innerText(), /只给李四四看的私聊/);
   assert.equal(await c.locator(".bubble").count(), 3);
   await b.getByRole("button", { name: "公共频道" }).click();
   await until(
@@ -198,7 +210,7 @@ try {
   await publicDownload.saveAs(publicPath);
   assert.equal(digest(await readFile(publicPath)), digest(publicBytes));
 
-  await a.getByRole("button", { name: "与 李四 私聊" }).click();
+  await a.getByRole("button", { name: "与 李四四 私聊" }).click();
   // Delay only the HTTP request: switching views must not retarget the upload.
   let finishUpload, uploadStarted;
   const ready = new Promise((resolve) => {
@@ -207,7 +219,7 @@ try {
   const release = new Promise((resolve) => {
     finishUpload = resolve;
   });
-  const privateBytes = Buffer.from("只给李四的文件\x00\x01");
+  const privateBytes = Buffer.from("只给李四四的文件\x00\x01");
   await a.route(
     "**/api/files?**",
     async (route) => {
@@ -237,8 +249,8 @@ try {
   );
   assert.equal(await a.locator(".file-card").count(), 1);
   assert.equal(await c.locator(".file-card").count(), 1);
-  await a.getByRole("button", { name: "与 李四 私聊" }).click();
-  await b.getByRole("button", { name: "与 张三 私聊" }).click();
+  await a.getByRole("button", { name: "与 李四四 私聊" }).click();
+  await b.getByRole("button", { name: "与 张三三 私聊" }).click();
   for (const page of [a, b])
     await until(
       async () => (await page.locator(".file-card").count()) === 1,
@@ -251,13 +263,13 @@ try {
   const privatePath = path.join(downloadDirectory, "private.bin");
   await (await privateDownloadEvent).saveAs(privatePath);
   assert.equal(digest(await readFile(privatePath)), digest(privateBytes));
-  const unauthorized = await context.request.get(
+  const unauthorized = await api.get(
     `${url}/api/files/${privateId}`,
-    { headers: { Authorization: `Bearer ${identities.get(c).token}` } },
+    { headers: { Authorization: `Bearer ${await tokenOf(c)}` } },
   );
   assert.equal(unauthorized.status(), 403);
   assert.equal(
-    (await context.request.get(`${url}/api/files/${publicId}`)).status(),
+    (await api.get(`${url}/api/files/${publicId}`)).status(),
     401,
   );
 
@@ -316,14 +328,17 @@ try {
     async () => (await a.locator(".user-list li").count()) === 2,
     "关闭页面清理",
   );
-  const duplicate = await context.newPage();
+  const duplicate = await newPage();
   await duplicate.goto(url);
-  await duplicate.getByLabel("你的昵称").fill("张三");
-  await duplicate.getByRole("button", { name: "进入聊天室" }).click();
+  await duplicate.getByRole("button", { name: /还没有账号/ }).click();
+  await duplicate.getByLabel("用户名").fill("张三三");
+  await duplicate.getByLabel("密码").fill(PASSWORD);
+  await duplicate.getByRole("button", { name: /^注册并登录/ }).click();
   await duplicate.getByRole("alert").waitFor();
-  assert.match(await duplicate.getByRole("alert").innerText(), /昵称已被使用/);
+  assert.match(await duplicate.getByRole("alert").innerText(), /用户名已被使用/);
   await duplicate.close();
   await b.getByRole("button", { name: "退出", exact: true }).click();
+  await b.getByLabel("用户名").waitFor();
   await until(
     async () => (await a.locator(".user-list li").count()) === 1,
     "主动退出",
@@ -341,13 +356,13 @@ try {
     "手动重新进入",
   );
   assert.equal(await a.locator(".bubble").count(), 0);
-  const expired = await context.request.get(`${url}/api/files/${publicId}`, {
-    headers: { Authorization: `Bearer ${identities.get(a).token}` },
+  const expired = await api.get(`${url}/api/files/${publicId}`, {
+    headers: { Authorization: `Bearer ${await tokenOf(a)}` },
   });
   assert.equal(expired.status(), 404);
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: 群聊/私聊、文件上传下载与内容校验、第三人下载拒绝、上传切换会话、超限与取消、未读提示、退出清理、文本安全、窄屏、服务重启及文件失效。",
+    "PASS: 注册登录、群聊/私聊、文件上传下载与内容校验、第三人下载拒绝、上传切换会话、超限与取消、未读提示、退出清理、文本安全、窄屏、服务重启及文件失效。",
   );
 } finally {
   await browser?.close();
@@ -355,7 +370,7 @@ try {
   if (downloadDirectory) {
     const resolved = path.resolve(downloadDirectory);
     if (
-      path.dirname(resolved) !== path.resolve(tmpdir()) ||
+      path.dirname(resolved) !== path.resolve(testRoot) ||
       !path.basename(resolved).startsWith("lan-chat-test-")
     ) {
       throw new Error("拒绝清理临时目录之外的路径");
