@@ -37,6 +37,21 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+CREATE TABLE IF NOT EXISTS messages (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    sender_user_id TEXT NOT NULL,
+    recipient_user_id TEXT,
+    text TEXT,
+    file_id TEXT,
+    file_name TEXT,
+    file_size INTEGER,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_public ON messages(kind, seq);
+CREATE INDEX IF NOT EXISTS idx_messages_pair
+    ON messages(sender_user_id, recipient_user_id, seq);
 """
 
 
@@ -224,3 +239,101 @@ class Database:
             conn.execute(
                 "DELETE FROM sessions WHERE token_hash = ?", (token_hash(token),)
             )
+
+    # ---------------------------- messages ----------------------------
+
+    def add_message(self, message_id, kind, sender_user_id, recipient_user_id,
+                    text, file_id, file_name, file_size, created_at):
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO messages (id, kind, sender_user_id, recipient_user_id,"
+                " text, file_id, file_name, file_size, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (message_id, kind, sender_user_id, recipient_user_id, text,
+                 file_id, file_name, file_size, created_at),
+            )
+
+    _MESSAGE_SELECT = (
+        "SELECT m.*,"
+        " s.username AS sender_username, s.display_name AS sender_display_name,"
+        " r.username AS recipient_username, r.display_name AS recipient_display_name"
+        " FROM messages m JOIN users s ON s.id = m.sender_user_id"
+        " LEFT JOIN users r ON r.id = m.recipient_user_id"
+    )
+
+    def _message_event(self, row):
+        sender = {
+            "id": row["sender_user_id"],
+            "user_id": row["sender_user_id"],
+            "username": row["sender_username"],
+            "nickname": row["sender_display_name"],
+        }
+        recipient = None
+        if row["recipient_user_id"]:
+            recipient = {
+                "id": row["recipient_user_id"],
+                "user_id": row["recipient_user_id"],
+                "username": row["recipient_username"],
+                "nickname": row["recipient_display_name"],
+            }
+        if row["kind"] == "file":
+            event = {
+                "type": "file",
+                "id": row["id"],
+                "sender": sender,
+                "file": {
+                    "id": row["file_id"],
+                    "name": row["file_name"],
+                    "size": row["file_size"],
+                },
+                "time": row["created_at"],
+            }
+            if recipient:
+                event["recipient"] = recipient
+            return event
+        event = {
+            "type": "private" if row["kind"] == "private" else "chat",
+            "id": row["id"],
+            "sender": sender,
+            "text": row["text"],
+            "time": row["created_at"],
+        }
+        if recipient:
+            event["recipient"] = recipient
+        return event
+
+    def _history(self, where, params, limit, before_id):
+        with self._read() as conn:
+            if before_id:
+                cursor = conn.execute(
+                    "SELECT seq FROM messages WHERE id = ?", (before_id,)
+                ).fetchone()
+                if cursor is None:
+                    return [], False
+                where += " AND m.seq < ?"
+                params = params + (cursor["seq"],)
+            rows = conn.execute(
+                f"{self._MESSAGE_SELECT} WHERE {where}"
+                " ORDER BY m.seq DESC LIMIT ?",
+                params + (limit + 1,),
+            ).fetchall()
+        has_more = len(rows) > limit
+        events = [self._message_event(row) for row in reversed(rows[:limit])]
+        return events, has_more
+
+    def public_history(self, limit=50, before_id=None):
+        where = (
+            "((m.kind = 'public') OR (m.kind = 'file' AND m.recipient_user_id IS NULL))"
+        )
+        return self._history(where, (), limit, before_id)
+
+    def private_history(self, user_id, peer_user_id, limit=50, before_id=None):
+        if not peer_user_id or peer_user_id == user_id:
+            return [], False
+        where = (
+            "m.kind IN ('private', 'file') AND m.recipient_user_id IS NOT NULL AND"
+            " ((m.sender_user_id = ? AND m.recipient_user_id = ?)"
+            " OR (m.sender_user_id = ? AND m.recipient_user_id = ?))"
+        )
+        params = (user_id, peer_user_id, peer_user_id, user_id)
+        return self._history(where, params, limit, before_id)
