@@ -7,6 +7,7 @@ import { formatSize } from "./fileTransfer";
 
 const {
   status,
+  account,
   user,
   users,
   messages,
@@ -15,31 +16,53 @@ const {
   unread,
   upload,
   downloading,
-  sendFile,
-  cancelFileUpload,
-  saveFile,
-  join,
-  disconnect,
+  login,
+  register,
+  logout,
+  restore,
+  connect,
   send,
   sendPrivate,
   openPrivate,
   closePrivate,
+  sendFile,
+  cancelFileUpload,
+  saveFile,
 } = useChat();
-const nickname = ref(""),
+const username = ref(""),
+  password = ref(""),
+  authMode = ref("login"),
+  busy = ref(false),
   draft = ref(""),
   showUsers = ref(false);
 const fileInput = ref(null);
-function selectFile(event) {
-  const file = event.target.files?.[0];
-  event.target.value = "";
-  if (file) sendFile(file);
-}
 const labels = {
   idle: "未连接",
   connecting: "连接中",
   connected: "已连接",
   disconnected: "连接已断开",
 };
+restore();
+function toggleAuth() {
+  authMode.value = authMode.value === "login" ? "register" : "login";
+  error.value = "";
+}
+async function submitAuth() {
+  if (busy.value) return;
+  busy.value = true;
+  try {
+    if (authMode.value === "login")
+      await login(username.value, password.value);
+    else await register(username.value, password.value);
+  } finally {
+    busy.value = false;
+  }
+}
+function selectFile(event) {
+  const file = event.target.files?.[0];
+  event.target.value = "";
+  if (file) sendFile(file);
+}
 const visibleMessages = computed(() => {
   if (!user.value) return [];
   return messages.value.filter((message) => {
@@ -77,9 +100,9 @@ function selectPerson(person) {
   openPrivate(person);
   showUsers.value = false;
 }
-function leave() {
-  disconnect();
+async function leave() {
   draft.value = "";
+  await logout();
 }
 </script>
 
@@ -91,36 +114,74 @@ function leave() {
         <strong>LAN Chat</strong
         ><span class="brand-caption">让沟通发生在身边</span>
       </div>
-      <span class="version">局域网聊天室 · 03</span>
+      <span class="version">局域网聊天室 · 04</span>
     </header>
-    <section v-if="!user" class="entry">
+    <section v-if="!account" class="entry">
       <div class="entry-copy">
         <span class="eyebrow">LOCAL NETWORK / REAL CONNECTION</span>
         <h1>同一个网络，<br />同一个聊天室。</h1>
-        <p>选一个昵称，和身边的人聊起来。<br />无需注册，打开网页即可加入。</p>
+        <p>
+          注册一个账号，聊天记录会跟着你。<br />打开网页即可加入。
+        </p>
         <div class="feature-tags">
-          <span>实时群聊</span><span>一对一私聊</span><span>文件传输</span>
+          <span>账号登录</span><span>群聊与私聊</span><span>文件传输</span>
         </div>
       </div>
-      <form class="join-card" @submit.prevent="join(nickname)">
-        <span class="eyebrow">加入公共频道</span>
-        <h2>你好，怎么称呼？</h2>
-        <label for="nickname">你的昵称</label
+      <form class="join-card" @submit.prevent="submitAuth">
+        <span class="eyebrow">{{
+          authMode === "login" ? "登录账号" : "注册账号"
+        }}</span>
+        <h2>{{ authMode === "login" ? "欢迎回来" : "创建你的账号" }}</h2>
+        <label for="username">用户名</label
         ><input
-          id="nickname"
-          v-model="nickname"
-          placeholder="输入 1～20 个字符"
-          autocomplete="off"
-          :disabled="status === 'connecting'"
+          id="username"
+          v-model="username"
+          placeholder="3～20 个字符"
+          autocomplete="username"
+          :disabled="busy"
           autofocus
         />
-        <p class="hint">昵称仅用于本次聊天，请勿填写敏感信息。</p>
+        <label for="password">密码</label
+        ><input
+          id="password"
+          v-model="password"
+          type="password"
+          :placeholder="
+            authMode === 'login' ? '输入密码' : '8～64 个字符'
+          "
+          :autocomplete="
+            authMode === 'login' ? 'current-password' : 'new-password'
+          "
+          :disabled="busy"
+        />
         <p v-if="error" class="error" role="alert">{{ error }}</p>
-        <button class="primary" :disabled="status === 'connecting'">
-          {{ status === "connecting" ? "正在连接…" : "进入聊天室 →" }}
+        <button class="primary" :disabled="busy">
+          {{
+            busy
+              ? "请稍候…"
+              : authMode === "login"
+                ? "登录 →"
+                : "注册并登录 →"
+          }}
         </button>
-        <p class="card-foot">同一局域网内，分享地址即可邀请朋友</p>
+        <button type="button" class="text-button auth-alt" @click="toggleAuth">
+          {{
+            authMode === "login" ? "还没有账号？注册" : "已有账号？直接登录"
+          }}
+        </button>
+        <p class="card-foot">账号只用于本课程演示，请勿使用真实密码</p>
       </form>
+    </section>
+    <section v-else-if="!user" class="entry">
+      <div class="join-card connecting-card">
+        <span class="eyebrow">CONNECTING</span>
+        <h2>正在连接聊天室…</h2>
+        <p v-if="error" class="error" role="alert">{{ error }}</p>
+        <button class="primary" @click="connect">重新连接</button>
+        <button type="button" class="text-button auth-alt" @click="logout">
+          退出登录
+        </button>
+      </div>
     </section>
     <section v-else class="workspace">
       <aside class="sidebar" :class="{ expanded: showUsers }">
@@ -185,7 +246,7 @@ function leave() {
           class="disconnect-banner"
           role="status"
         >
-          连接已断开，重新进入后可继续聊天。<button @click="join(nickname)">
+          连接已断开，重新进入后可继续聊天。<button @click="connect">
             重新进入
           </button>
         </div>

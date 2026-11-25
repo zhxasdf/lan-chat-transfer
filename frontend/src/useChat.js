@@ -1,8 +1,11 @@
 import { ref, onBeforeUnmount } from "vue";
 import { MAX_FILE_SIZE, uploadFile, downloadFile } from "./fileTransfer";
 
+const TOKEN_KEY = "lan-chat-token";
+
 export function useChat() {
   const status = ref("idle"),
+    account = ref(null),
     user = ref(null),
     users = ref([]),
     messages = ref([]),
@@ -16,6 +19,16 @@ export function useChat() {
   let token = null;
   let pendingUpload = null;
   const downloads = new Set();
+  function saveToken(value) {
+    token = value;
+    if (value) localStorage.setItem(TOKEN_KEY, value);
+    else localStorage.removeItem(TOKEN_KEY);
+  }
+  function clearSession() {
+    saveToken(null);
+    account.value = null;
+    user.value = null;
+  }
   function cancelUpload() {
     const pending = pendingUpload;
     pendingUpload = null;
@@ -27,7 +40,6 @@ export function useChat() {
     for (const controller of downloads) controller.abort();
     downloads.clear();
     downloading.value = {};
-    token = null;
   }
   function clearState() {
     users.value = [];
@@ -50,13 +62,9 @@ export function useChat() {
     if (!user.value) return null;
     return event.sender.id === user.value.id ? event.recipient : event.sender;
   }
-  function join(nickname) {
+  function connect() {
+    if (!token) return;
     disconnect();
-    const name = nickname.trim();
-    if ([...name].length < 1 || [...name].length > 20) {
-      error.value = "昵称须为1～20个字符";
-      return;
-    }
     status.value = "connecting";
     const current = new WebSocket(
       `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`,
@@ -71,7 +79,7 @@ export function useChat() {
     }, 10000);
     current.onopen = () => {
       if (socket === current)
-        current.send(JSON.stringify({ type: "join", nickname: name }));
+        current.send(JSON.stringify({ type: "auth", token }));
     };
     current.onmessage = ({ data }) => {
       if (socket !== current) return;
@@ -84,7 +92,6 @@ export function useChat() {
       if (event.type === "welcome") {
         clearTimeout(timer);
         user.value = event.user;
-        token = event.token;
         status.value = "connected";
       } else if (event.type === "users") users.value = event.users;
       else if (
@@ -109,6 +116,7 @@ export function useChat() {
           clearTimeout(timer);
           current.close();
           status.value = "disconnected";
+          if (String(event.message).includes("登录")) clearSession();
         }
       }
     };
@@ -123,6 +131,80 @@ export function useChat() {
       status.value = "disconnected";
       users.value = [];
     };
+  }
+  async function readJson(response) {
+    try {
+      return await response.json();
+    } catch {
+      return {};
+    }
+  }
+  function detail(body, fallback) {
+    return typeof body.detail === "string" ? body.detail : fallback;
+  }
+  async function login(username, password) {
+    error.value = "";
+    const response = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const body = await readJson(response);
+    if (!response.ok) {
+      error.value = detail(body, "登录失败，请稍后重试");
+      return false;
+    }
+    saveToken(body.token);
+    account.value = body.user;
+    connect();
+    return true;
+  }
+  async function register(username, password) {
+    error.value = "";
+    const response = await fetch("/api/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    const body = await readJson(response);
+    if (!response.ok) {
+      error.value = detail(body, "注册失败，请稍后重试");
+      return false;
+    }
+    return login(username, password);
+  }
+  async function logout() {
+    const current = token;
+    disconnect();
+    clearSession();
+    status.value = "idle";
+    if (current) {
+      try {
+        await fetch("/api/auth/logout", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${current}` },
+        });
+      } catch {
+        /* 本地已退出，服务端会话由过期时间清理 */
+      }
+    }
+  }
+  async function restore() {
+    const saved = localStorage.getItem(TOKEN_KEY);
+    if (!saved) return;
+    token = saved;
+    try {
+      const response = await fetch("/api/auth/me", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) throw new Error("expired");
+      const body = await response.json();
+      account.value = body.user;
+      connect();
+    } catch {
+      saveToken(null);
+      account.value = null;
+    }
   }
   function openPrivate(person) {
     if (!user.value || !person || person.id === user.value.id) return;
@@ -184,7 +266,7 @@ export function useChat() {
       return;
     }
     if (!token) {
-      error.value = "连接凭证缺失，请重新进入";
+      error.value = "登录凭证缺失，请重新登录";
       return;
     }
     const target = activePeer.value ? { ...activePeer.value } : null;
@@ -241,6 +323,7 @@ export function useChat() {
   onBeforeUnmount(disconnect);
   return {
     status,
+    account,
     user,
     users,
     messages,
@@ -249,7 +332,12 @@ export function useChat() {
     unread,
     upload,
     downloading,
-    join,
+    login,
+    register,
+    logout,
+    restore,
+    connect,
+    join: connect,
     disconnect,
     send,
     sendPrivate,
