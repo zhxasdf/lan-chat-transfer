@@ -1,4 +1,5 @@
 import { ref, onBeforeUnmount } from "vue";
+import { MAX_FILE_SIZE, uploadFile, downloadFile } from "./fileTransfer";
 
 export function useChat() {
   const status = ref("idle"),
@@ -7,9 +8,27 @@ export function useChat() {
     messages = ref([]),
     error = ref(""),
     activePeer = ref(null),
-    unread = ref({});
+    unread = ref({}),
+    upload = ref(null),
+    downloading = ref({});
   let socket = null;
   let timer = null;
+  let token = null;
+  let pendingUpload = null;
+  const downloads = new Set();
+  function cancelUpload() {
+    const pending = pendingUpload;
+    pendingUpload = null;
+    upload.value = null;
+    pending?.cancel();
+  }
+  function stopTransfers() {
+    cancelUpload();
+    for (const controller of downloads) controller.abort();
+    downloads.clear();
+    downloading.value = {};
+    token = null;
+  }
   function clearState() {
     users.value = [];
     status.value = "idle";
@@ -19,6 +38,7 @@ export function useChat() {
     unread.value = {};
   }
   function disconnect() {
+    stopTransfers();
     clearTimeout(timer);
     const previous = socket;
     socket = null;
@@ -64,16 +84,18 @@ export function useChat() {
       if (event.type === "welcome") {
         clearTimeout(timer);
         user.value = event.user;
+        token = event.token;
         status.value = "connected";
       } else if (event.type === "users") users.value = event.users;
       else if (
         event.type === "chat" ||
         event.type === "notice" ||
-        event.type === "private"
+        event.type === "private" ||
+        event.type === "file"
       ) {
         messages.value.push(event);
         if (messages.value.length > 500) messages.value.shift();
-        if (event.type === "private") {
+        if (event.recipient && event.sender.id !== user.value?.id) {
           const peer = peerOf(event);
           if (peer && peer.id !== activePeer.value?.id)
             unread.value = {
@@ -96,6 +118,7 @@ export function useChat() {
     };
     current.onclose = () => {
       if (socket !== current) return;
+      stopTransfers();
       clearTimeout(timer);
       status.value = "disconnected";
       users.value = [];
@@ -149,6 +172,72 @@ export function useChat() {
     );
     return true;
   }
+  async function sendFile(file) {
+    error.value = "";
+    if (!file || !writable()) return;
+    if (pendingUpload) {
+      error.value = "请等待当前上传完成";
+      return;
+    }
+    if (file.size > MAX_FILE_SIZE) {
+      error.value = "文件超过20 MiB限制";
+      return;
+    }
+    if (!token) {
+      error.value = "连接凭证缺失，请重新进入";
+      return;
+    }
+    const target = activePeer.value ? { ...activePeer.value } : null;
+    if (target && !users.value.some((person) => person.id === target.id)) {
+      error.value = "对方不在线，无法发送文件";
+      return;
+    }
+    const state = {
+      name: file.name,
+      target: target?.nickname || "公共频道",
+      progress: 0,
+    };
+    upload.value = state;
+    const transfer = uploadFile(file, token, target, (progress) => {
+      if (pendingUpload === transfer) upload.value = { ...state, progress };
+    });
+    pendingUpload = transfer;
+    try {
+      await transfer.done;
+    } catch (cause) {
+      if (pendingUpload === transfer) error.value = cause.message;
+    } finally {
+      if (pendingUpload === transfer) {
+        pendingUpload = null;
+        upload.value = null;
+      }
+    }
+  }
+  function cancelFileUpload() {
+    cancelUpload();
+    error.value = "上传已取消；若文件卡片已出现，表示服务器已完成发送";
+  }
+  async function saveFile(file) {
+    error.value = "";
+    if (!writable() || !token || downloading.value[file.id]) return;
+    const currentToken = token;
+    const controller = new AbortController();
+    downloads.add(controller);
+    downloading.value = { ...downloading.value, [file.id]: true };
+    try {
+      await downloadFile(file, currentToken, controller.signal);
+    } catch (cause) {
+      if (!controller.signal.aborted && token === currentToken)
+        error.value = cause.message;
+    } finally {
+      downloads.delete(controller);
+      if (token === currentToken) {
+        const remaining = { ...downloading.value };
+        delete remaining[file.id];
+        downloading.value = remaining;
+      }
+    }
+  }
   onBeforeUnmount(disconnect);
   return {
     status,
@@ -158,11 +247,16 @@ export function useChat() {
     error,
     activePeer,
     unread,
+    upload,
+    downloading,
     join,
     disconnect,
     send,
     sendPrivate,
     openPrivate,
     closePrivate,
+    sendFile,
+    cancelFileUpload,
+    saveFile,
   };
 }

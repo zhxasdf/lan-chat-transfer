@@ -1,6 +1,14 @@
 <script setup>
 import { ref, watch, nextTick } from "vue";
-const props = defineProps({ messages: Array, selfId: String, privatePeer: Object });
+import { formatSize } from "../fileTransfer";
+const props = defineProps({
+  messages: Array,
+  selfId: String,
+  privatePeer: Object,
+  downloading: Object,
+  connected: Boolean,
+});
+defineEmits(["download"]);
 const list = ref(null);
 function time(value) {
   return new Date(value).toLocaleTimeString("zh-CN", {
@@ -34,7 +42,9 @@ watch(
       <span>{{ privatePeer ? "@" : "#" }}</span>
       <h3>
         {{
-          privatePeer ? `与 ${privatePeer.nickname} 的私聊` : "欢迎来到公共聊天室"
+          privatePeer
+            ? `与 ${privatePeer.nickname} 的私聊`
+            : "欢迎来到公共聊天室"
         }}
       </h3>
       <p>
@@ -62,7 +72,27 @@ watch(
             <strong>{{ message.sender.nickname }}</strong
             ><time>{{ time(message.time) }}</time>
           </div>
-          <div class="bubble">{{ message.text }}</div>
+          <div
+            v-if="message.type === 'file'"
+            class="file-card"
+            :data-file-id="message.file.id"
+          >
+            <span class="file-icon" aria-hidden="true">▤</span>
+            <div class="file-details">
+              <strong class="file-name">{{ message.file.name }}</strong
+              ><span>{{ formatSize(message.file.size) }} · 临时文件</span>
+            </div>
+            <button
+              type="button"
+              class="file-download"
+              :aria-label="`下载 ${message.file.name}`"
+              :disabled="!connected || downloading?.[message.file.id]"
+              @click="$emit('download', message.file)"
+            >
+              {{ downloading?.[message.file.id] ? "下载中…" : "下载" }}
+            </button>
+          </div>
+          <div v-else class="bubble">{{ message.text }}</div>
         </div>
       </article></template
     >
