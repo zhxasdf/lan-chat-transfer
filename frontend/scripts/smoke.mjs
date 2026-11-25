@@ -315,6 +315,21 @@ try {
     "取消上传",
   );
   assert.equal(await a.locator(".file-card").count(), 1);
+  // 刷新页面后，登录态与公共/私聊历史都应恢复。
+  await a.reload();
+  await a.getByRole("button", { name: "退出", exact: true }).waitFor();
+  await until(
+    async () => (await a.locator(".bubble").count()) === 3,
+    "刷新后公共历史恢复",
+  );
+  assert.equal(await a.locator(".file-card").count(), 1);
+  await a.getByRole("button", { name: "与 李四四 私聊" }).click();
+  await until(
+    async () => (await a.locator(".bubble").count()) === 1,
+    "刷新后私聊历史恢复",
+  );
+  assert.equal(await a.locator(".file-card").count(), 1);
+  await a.getByRole("button", { name: "公共频道" }).click();
   await c.setViewportSize({ width: 390, height: 844 });
   assert.equal(
     await c.evaluate(
@@ -355,7 +370,11 @@ try {
     async () => (await a.locator(".connection").innerText()) === "已连接",
     "手动重新进入",
   );
-  assert.equal(await a.locator(".bubble").count(), 0);
+  await until(
+    async () => (await a.locator(".bubble").count()) === 3,
+    "重新进入后恢复历史",
+  );
+  assert.equal(await a.locator(".file-card").count(), 1);
   const expired = await api.get(`${url}/api/files/${publicId}`, {
     headers: { Authorization: `Bearer ${await tokenOf(a)}` },
   });
