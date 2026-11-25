@@ -1,6 +1,6 @@
-"""Temporary file storage and authenticated HTTP transfers for live chat peers."""
+"""Temporary file storage and account-authenticated HTTP transfers."""
+import asyncio
 import re
-import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,8 +28,8 @@ class StoredFile:
     id: str
     name: str
     size: int
-    sender_id: str
-    recipient_id: str | None
+    owner_user_id: str
+    recipient_user_id: str | None
 
     def public(self):
         return {"id": self.id, "name": self.name, "size": self.size}
@@ -44,27 +44,32 @@ class FileStore:
         self.used = 0
         self.uploading: set[str] = set()
 
-    def reserve(self, peer_id):
+    def reserve(self, user_id):
         # All accounting runs synchronously on the application event loop.
-        if peer_id in self.uploading:
+        if user_id in self.uploading:
             raise HTTPException(409, "已有文件正在上传")
         if self.used + (len(self.uploading) + 1) * self.max_size > self.limit:
             raise HTTPException(507, "本次服务的文件空间不足，请稍后重试或重启服务清理")
-        self.uploading.add(peer_id)
+        self.uploading.add(user_id)
 
     def commit(self, record):
         self.records[record.id] = record
         self.used += record.size
 
 
-def authenticated_peer(request: Request):
+async def authenticated_user(request: Request):
     authorization = request.headers.get("authorization", "")
     kind, _, token = authorization.partition(" ")
-    if kind.lower() == "bearer" and token:
-        for peer in request.app.state.room.peers.values():
-            if secrets.compare_digest(peer.token.encode(), token.encode()):
-                return peer
-    raise HTTPException(401, "连接凭证无效，请重新进入聊天室")
+    if kind.lower() != "bearer" or not token:
+        raise HTTPException(401, "登录凭证无效，请重新登录")
+    user = await asyncio.to_thread(request.app.state.db.session_user, token)
+    if user is None:
+        raise HTTPException(401, "登录已过期，请重新登录")
+    return user
+
+
+def online_peer(room, user_id):
+    return next((peer for peer in room.peers.values() if peer.user_id == user_id), None)
 
 
 def target_peer(room, sender, target_id):
@@ -82,8 +87,11 @@ def target_peer(room, sender, target_id):
 async def upload_file(request: Request, filename: str = "file", to: str | None = None):
     room = request.app.state.room
     store: FileStore = request.app.state.files
+    user = await authenticated_user(request)
     async with room.lock:
-        sender = authenticated_peer(request)
+        sender = online_peer(room, user["id"])
+        if sender is None:
+            raise HTTPException(401, "请先在浏览器中登录聊天室")
         target_peer(room, sender, to)
     if request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/octet-stream":
         raise HTTPException(415, "请使用二进制文件请求体")
@@ -97,7 +105,7 @@ async def upload_file(request: Request, filename: str = "file", to: str | None =
             raise HTTPException(400, "文件长度无效")
         if length > store.max_size:
             raise HTTPException(413, "文件超过20 MiB限制")
-    store.reserve(sender.id)
+    store.reserve(user["id"])
     file_id = str(uuid4())
     path = store.root / file_id
     committed = False
@@ -111,14 +119,27 @@ async def upload_file(request: Request, filename: str = "file", to: str | None =
                 await output.write(chunk)
         # Do not retain the room lock while receiving or writing file contents.
         async with room.lock:
-            current = authenticated_peer(request)
-            if current is not sender:
-                raise HTTPException(401, "连接已改变，请重新发送文件")
+            current = await authenticated_user(request)
+            if current["id"] != user["id"]:
+                raise HTTPException(401, "登录账号已变化，请重新发送文件")
+            sender = online_peer(room, current["id"])
+            if sender is None:
+                raise HTTPException(401, "聊天连接已断开，请重新发送文件")
             target = target_peer(room, sender, to)
-            record = StoredFile(file_id, safe_filename(filename), size, sender.id, to)
-            event = {"type": "file", "id": str(uuid4()),
-                     "sender": sender.public(), "file": record.public(),
-                     "time": datetime.now(timezone.utc).isoformat()}
+            record = StoredFile(
+                file_id,
+                safe_filename(filename),
+                size,
+                current["id"],
+                target.user_id if target else None,
+            )
+            event = {
+                "type": "file",
+                "id": str(uuid4()),
+                "sender": sender.public(),
+                "file": record.public(),
+                "time": datetime.now(timezone.utc).isoformat(),
+            }
             if target:
                 event["recipient"] = target.public()
             store.commit(record)
@@ -133,24 +154,31 @@ async def upload_file(request: Request, filename: str = "file", to: str | None =
     except OSError:
         raise HTTPException(507, "文件读写失败，请检查临时磁盘空间") from None
     finally:
-        store.uploading.discard(sender.id)
+        store.uploading.discard(user["id"])
         if not committed:
             path.unlink(missing_ok=True)
 
 
 @router.get("/{file_id}")
 async def download_file(request: Request, file_id: str):
+    user = await authenticated_user(request)
+    store: FileStore = request.app.state.files
     async with request.app.state.room.lock:
-        peer = authenticated_peer(request)
-        store: FileStore = request.app.state.files
         record = store.records.get(file_id)
         if record is None:
             raise HTTPException(404, "文件不存在或已随服务重启清理")
-        if record.recipient_id is not None and peer.id not in (record.sender_id, record.recipient_id):
+        if record.recipient_user_id is not None and user["id"] not in (
+            record.owner_user_id,
+            record.recipient_user_id,
+        ):
             raise HTTPException(403, "你无权下载这个私聊文件")
         path = store.root / record.id
         if not path.is_file():
             raise HTTPException(404, "文件已不可用")
-    return FileResponse(path, media_type="application/octet-stream", filename=record.name,
-                        content_disposition_type="attachment",
-                        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        filename=record.name,
+        content_disposition_type="attachment",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
