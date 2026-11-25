@@ -16,6 +16,9 @@ const {
   unread,
   upload,
   downloading,
+  historyLoading,
+  hasMoreHistory,
+  loadMoreHistory,
   login,
   register,
   logout,
@@ -69,8 +72,10 @@ const visibleMessages = computed(() => {
     if (!activePeer.value) return !message.recipient;
     if (!message.recipient) return false;
     const peer =
-      message.sender.id === user.value.id ? message.recipient : message.sender;
-    return peer.id === activePeer.value.id;
+      message.sender.user_id === user.value.user_id
+        ? message.recipient
+        : message.sender;
+    return peer.user_id === activePeer.value.userId;
   });
 });
 const peerOnline = computed(
@@ -236,10 +241,14 @@ async function leave() {
         <MessageList
           :messages="visibleMessages"
           :self-id="user.id"
+          :self-user-id="user.user_id"
           :private-peer="activePeer"
           :downloading="downloading"
           :connected="status === 'connected'"
+          :history-loading="historyLoading"
+          :has-more="hasMoreHistory"
           @download="saveFile"
+          @loadmore="loadMoreHistory"
         />
         <div
           v-if="status === 'disconnected'"
