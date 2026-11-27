@@ -143,7 +143,7 @@ def test_invalid_targets_and_missing_file(client):
     with client.websocket_connect("/ws") as ws:
         user, headers = enter(client, ws, "测试员")
         assert upload(client, headers, to=user["id"]).status_code == 400
-        assert upload(client, headers, to="not-online").status_code == 409
+        assert upload(client, headers, to="not-existing").status_code == 404
         assert client.get("/api/files/not-found", headers=headers).status_code == 404
         assert_clean(client)
 
@@ -207,7 +207,7 @@ def test_write_failure_cleans_partial_file(client):
         assert upload(client, headers).status_code == 201
 
 
-def test_shutdown_cleanup_and_restart(tmp_path):
+def test_file_content_and_capacity_survive_restart(tmp_path):
     app = create_app(db_path=tmp_path / "chat.db")
     with TestClient(app) as client:
         root = app.state.files.root
@@ -215,11 +215,13 @@ def test_shutdown_cleanup_and_restart(tmp_path):
             _, headers = enter(client, ws, "测试员")
             file_id = upload(client, headers).json()["file_id"]
             assert (root / file_id).is_file()
-    assert not root.exists()
+    assert (root / file_id).is_file()
     with TestClient(create_app(db_path=tmp_path / "chat.db")) as client, \
             client.websocket_connect("/ws") as ws:
         _, headers = enter(client, ws, "测试员", register=False)
-        assert client.get(f"/api/files/{file_id}", headers=headers).status_code == 404
+        result = client.get(f"/api/files/{file_id}", headers=headers)
+        assert result.status_code == 200 and result.content == b"hello"
+        assert client.app.state.files.used == 5
 
 
 async def asgi_upload(app, headers, receive):
@@ -269,8 +271,8 @@ def test_target_leaves_during_upload(client):
             async for chunk in original(request):
                 yield chunk
         with patch.object(Request, "stream", interleaved):
-            assert upload(client, headers, to=target["id"]).status_code == 409
-        assert_clean(client)
+            assert upload(client, headers, to=target["id"]).status_code == 201
+        assert len(client.app.state.files.records) == 1
 
 
 def test_cancelled_connection_still_notifies_other_users(tmp_path):

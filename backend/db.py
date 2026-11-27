@@ -52,6 +52,23 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_public ON messages(kind, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_pair
     ON messages(sender_user_id, recipient_user_id, seq);
+CREATE TABLE IF NOT EXISTS private_reads (
+    user_id TEXT NOT NULL REFERENCES users(id),
+    peer_user_id TEXT NOT NULL REFERENCES users(id),
+    through_seq INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, peer_user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_messages_inbox ON messages(recipient_user_id, sender_user_id, seq);
+CREATE TABLE IF NOT EXISTS files (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL REFERENCES users(id),
+    recipient_user_id TEXT REFERENCES users(id),
+    created_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('available','deleted','missing'))
+);
 """
 
 
@@ -245,20 +262,23 @@ class Database:
     def add_message(self, message_id, kind, sender_user_id, recipient_user_id,
                     text, file_id, file_name, file_size, created_at):
         with self._write() as conn:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO messages (id, kind, sender_user_id, recipient_user_id,"
                 " text, file_id, file_name, file_size, created_at)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (message_id, kind, sender_user_id, recipient_user_id, text,
                  file_id, file_name, file_size, created_at),
             )
+            return cursor.lastrowid
 
     _MESSAGE_SELECT = (
         "SELECT m.*,"
         " s.username AS sender_username, s.display_name AS sender_display_name,"
-        " r.username AS recipient_username, r.display_name AS recipient_display_name"
+        " r.username AS recipient_username, r.display_name AS recipient_display_name,"
+        " f.status AS file_status, f.sha256 AS file_sha256"
         " FROM messages m JOIN users s ON s.id = m.sender_user_id"
         " LEFT JOIN users r ON r.id = m.recipient_user_id"
+        " LEFT JOIN files f ON f.id = m.file_id"
     )
 
     def _message_event(self, row):
@@ -285,11 +305,14 @@ class Database:
                     "id": row["file_id"],
                     "name": row["file_name"],
                     "size": row["file_size"],
+                    "sha256": row["file_sha256"],
+                    "status": row["file_status"] or "missing",
                 },
                 "time": row["created_at"],
             }
             if recipient:
                 event["recipient"] = recipient
+            event["seq"] = row["seq"]
             return event
         event = {
             "type": "private" if row["kind"] == "private" else "chat",
@@ -300,6 +323,7 @@ class Database:
         }
         if recipient:
             event["recipient"] = recipient
+        event["seq"] = row["seq"]
         return event
 
     def _history(self, where, params, limit, before_id):
@@ -337,3 +361,126 @@ class Database:
         )
         params = (user_id, peer_user_id, peer_user_id, user_id)
         return self._history(where, params, limit, before_id)
+
+    @staticmethod
+    def _pair(user_id, peer_id):
+        return (
+            "m.recipient_user_id IS NOT NULL AND m.kind IN ('private', 'file') AND "
+            "((m.sender_user_id = ? AND m.recipient_user_id = ?) OR "
+            "(m.sender_user_id = ? AND m.recipient_user_id = ?))",
+            (user_id, peer_id, peer_id, user_id),
+        )
+
+    def conversations(self, user_id):
+        """Only conversation participants can see summaries and unread counts."""
+        with self._read() as conn:
+            rows = conn.execute(
+                "WITH pairs AS (SELECT CASE WHEN sender_user_id = ? THEN recipient_user_id "
+                "ELSE sender_user_id END AS peer_id, MAX(seq) AS latest "
+                "FROM messages WHERE recipient_user_id IS NOT NULL AND kind IN ('private','file') "
+                "AND (sender_user_id = ? OR recipient_user_id = ?) GROUP BY peer_id) "
+                "SELECT u.*, m.seq, m.text, m.kind, m.created_at, COALESCE(r.through_seq,0) AS read_seq, "
+                "(SELECT COUNT(*) FROM messages incoming WHERE incoming.recipient_user_id = ? "
+                "AND incoming.sender_user_id = u.id AND incoming.kind IN ('private','file') "
+                "AND incoming.seq > COALESCE(r.through_seq,0)) AS unread "
+                "FROM pairs p JOIN users u ON u.id = p.peer_id JOIN messages m ON m.seq = p.latest "
+                "LEFT JOIN private_reads r ON r.user_id = ? AND r.peer_user_id = u.id "
+                "ORDER BY m.seq DESC",
+                (user_id, user_id, user_id, user_id, user_id),
+            ).fetchall()
+        return [{"peer": {"id": row["id"], "user_id": row["id"],
+                           "username": row["username"], "nickname": row["display_name"]},
+                 "unread": row["unread"], "read_seq": row["read_seq"],
+                 "last_seq": row["seq"], "last_text": row["text"] if row["kind"] == "private" else "[文件]",
+                 "time": row["created_at"]} for row in rows]
+
+    def private_page(self, user_id, peer_id, limit=50, after_id=None):
+        """Start at the oldest unread, then page forward without skipping a backlog."""
+        where, params = self._pair(user_id, peer_id)
+        with self._read() as conn:
+            if after_id:
+                row = conn.execute(
+                    f"SELECT m.seq FROM messages m WHERE {where} AND m.id = ?",
+                    params + (after_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError("消息游标不属于当前私聊")
+                start = row["seq"]
+            else:
+                row = conn.execute(
+                    "SELECT through_seq FROM private_reads WHERE user_id = ? AND peer_user_id = ?",
+                    (user_id, peer_id),
+                ).fetchone()
+                start = row["through_seq"] if row else 0
+                unread = conn.execute(
+                    "SELECT MIN(seq) AS first_seq FROM messages WHERE sender_user_id = ? AND recipient_user_id = ? "
+                    "AND kind IN ('private','file') AND seq > ?", (peer_id, user_id, start),
+                ).fetchone()
+                start = unread["first_seq"] - 1 if unread["first_seq"] is not None else None
+            if start is None:
+                rows = conn.execute(
+                    f"{self._MESSAGE_SELECT} WHERE {where} ORDER BY m.seq DESC LIMIT ?",
+                    params + (limit + 1,),
+                ).fetchall()
+                events = [self._message_event(row) for row in reversed(rows[:limit])]
+                return {"messages": events, "has_more": len(rows) > limit, "has_newer": False,
+                        "next_after": events[-1]["id"] if events else None}
+            if start is not None:
+                rows = conn.execute(
+                    f"{self._MESSAGE_SELECT} WHERE {where} AND m.seq > ? ORDER BY m.seq LIMIT ?",
+                    params + (start, limit + 1),
+                ).fetchall()
+                page = rows[:limit]
+                older = bool(page and conn.execute(
+                    f"SELECT 1 FROM messages m WHERE {where} AND m.seq < ? LIMIT 1",
+                    params + (page[0]["seq"],),
+                ).fetchone())
+                events = [self._message_event(row) for row in page]
+                return {"messages": events, "has_more": older, "has_newer": len(rows) > limit,
+                        "next_after": events[-1]["id"] if events else after_id}
+
+    def mark_private_read(self, user_id, peer_id, message_id):
+        where, params = self._pair(user_id, peer_id)
+        with self._write() as conn:
+            row = conn.execute(
+                f"SELECT m.seq FROM messages m WHERE {where} AND m.id = ?",
+                params + (message_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("消息不属于当前私聊")
+            conn.execute(
+                "INSERT INTO private_reads(user_id,peer_user_id,through_seq) VALUES (?,?,?) "
+                "ON CONFLICT(user_id,peer_user_id) DO UPDATE SET "
+                "through_seq = MAX(private_reads.through_seq, excluded.through_seq)",
+                (user_id, peer_id, row["seq"]),
+            )
+
+    def file_records(self):
+        with self._read() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM files").fetchall()]
+
+    def get_file(self, file_id):
+        with self._read() as conn:
+            row = conn.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+            return dict(row) if row else None
+
+    def set_file_status(self, file_id, status):
+        with self._write() as conn:
+            conn.execute("UPDATE files SET status = ? WHERE id = ?", (status, file_id))
+
+    def add_file_message(self, record, message_id, created_at):
+        """The file metadata and its chat card either both commit, or neither does."""
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO files(id,name,size,sha256,owner_user_id,recipient_user_id,created_at,status) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (record.id, record.name, record.size, record.sha256, record.owner_user_id,
+                 record.recipient_user_id, created_at, "available"),
+            )
+            cursor = conn.execute(
+                "INSERT INTO messages(id,kind,sender_user_id,recipient_user_id,file_id,file_name,file_size,created_at) "
+                "VALUES (?,'file',?,?,?,?,?,?)",
+                (message_id, record.owner_user_id, record.recipient_user_id,
+                 record.id, record.name, record.size, created_at),
+            )
+            return cursor.lastrowid

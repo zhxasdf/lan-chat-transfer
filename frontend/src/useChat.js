@@ -1,4 +1,4 @@
-import { ref, onBeforeUnmount } from "vue";
+import { ref, watch, nextTick, onBeforeUnmount } from "vue";
 import { MAX_FILE_SIZE, uploadFile, downloadFile } from "./fileTransfer";
 
 const TOKEN_KEY = "lan-chat-token";
@@ -12,8 +12,12 @@ export function useChat() {
     error = ref(""),
     activePeer = ref(null),
     unread = ref({}),
+    conversations = ref([]),
+    hasNewer = ref(false),
+    info = ref(""),
     upload = ref(null),
     downloading = ref({}),
+    deleting = ref({}),
     history = ref({}),
     historyLoading = ref(false),
     hasMoreHistory = ref(true);
@@ -24,6 +28,7 @@ export function useChat() {
   let restoring = 0;
   let pendingUpload = null;
   const downloads = new Set();
+  const fileStates = new Map();
   function saveToken(value) {
     token = value;
     if (value) localStorage.setItem(TOKEN_KEY, value);
@@ -45,14 +50,19 @@ export function useChat() {
     for (const controller of downloads) controller.abort();
     downloads.clear();
     downloading.value = {};
+    deleting.value = {};
   }
   function clearState() {
+    fileStates.clear();
     users.value = [];
     status.value = "idle";
     user.value = null;
     messages.value = [];
     activePeer.value = null;
     unread.value = {};
+    conversations.value = [];
+    info.value = "";
+    hasNewer.value = false;
     history.value = {};
     historyLoading.value = false;
     hasMoreHistory.value = true;
@@ -76,43 +86,159 @@ export function useChat() {
   }
   function historyState(key) {
     if (!history.value[key])
-      history.value[key] = { cursor: null, hasMore: true };
+      history.value[key] = {
+        cursor: null,
+        hasMore: true,
+        ready: false,
+        loading: false,
+        hasNewer: false,
+        forward: null,
+        forwardSeq: 0,
+        ackSeq: 0,
+        acknowledging: false,
+      };
     return history.value[key];
   }
   function syncHistoryState() {
     hasMoreHistory.value = historyState(historyKey()).hasMore;
+    hasNewer.value = historyState(historyKey()).hasNewer;
+    historyLoading.value = historyState(historyKey()).loading;
   }
-  async function fetchHistory() {
-    if (!token || status.value !== "connected" || historyLoading.value) return;
+  async function fetchHistory(direction = "older") {
+    if (!token || status.value !== "connected") return;
     const key = historyKey();
+    const selected = activePeer.value ? { ...activePeer.value } : null;
     const requestGeneration = generation;
     const state = historyState(key);
-    if (!state.hasMore) return;
-    historyLoading.value = true;
+    if (
+      state.loading ||
+      (state.ready && !(direction === "newer" ? state.hasNewer : state.hasMore))
+    )
+      return;
+    const initial = !state.ready;
+    state.loading = true;
+    syncHistoryState();
     try {
       const params = new URLSearchParams({
-        kind: activePeer.value ? "private" : "public",
+        kind: selected ? "private" : "public",
         limit: "50",
       });
-      if (activePeer.value) params.set("peer", activePeer.value.userId);
-      if (state.cursor) params.set("before", state.cursor);
+      if (selected) params.set("peer", selected.userId);
+      if (selected && initial) params.set("unread", "true");
+      else if (direction === "newer" && state.forward)
+        params.set("after", state.forward);
+      else if (state.cursor) params.set("before", state.cursor);
       const response = await fetch(`/api/history?${params}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
-      if (!response.ok) return;
+      if (!response.ok) throw new Error("聊天记录加载失败，请重试");
       const body = await response.json();
       if (generation !== requestGeneration) return;
-      const incoming = Array.isArray(body.messages) ? body.messages : [];
+      const incoming = (Array.isArray(body.messages) ? body.messages : []).map(
+        (message) =>
+          message.file && fileStates.has(message.file.id)
+            ? { ...message, file: fileStates.get(message.file.id) }
+            : message,
+      );
       const seen = new Set(messages.value.map((message) => message.id));
       const fresh = incoming.filter((message) => !seen.has(message.id));
-      if (fresh.length) messages.value = [...fresh, ...messages.value];
-      if (incoming.length) state.cursor = incoming[0].id;
-      state.hasMore = Boolean(body.has_more);
+      if (fresh.length) messages.value = [...messages.value, ...fresh];
+      if (initial || direction === "older") {
+        if (incoming.length) state.cursor = incoming[0].id;
+        state.hasMore = Boolean(body.has_more);
+      }
+      if (selected && (initial || direction === "newer")) {
+        state.forward = body.next_after;
+        state.forwardSeq = incoming.at(-1)?.seq || state.forwardSeq;
+        state.hasNewer = Boolean(body.has_newer);
+      }
+      state.ready = true;
       syncHistoryState();
     } catch {
-      /* 网络失败时保留当前状态，再次上滑可重试 */
+      if (generation === requestGeneration)
+        error.value = "聊天记录加载失败，请重试";
     } finally {
-      if (generation === requestGeneration) historyLoading.value = false;
+      state.loading = false;
+      if (generation === requestGeneration) {
+        syncHistoryState();
+        await nextTick();
+        acknowledge();
+      }
+    }
+  }
+  async function acknowledge() {
+    const selected = activePeer.value;
+    if (
+      !selected ||
+      document.visibilityState !== "visible" ||
+      status.value !== "connected"
+    )
+      return;
+    const state = historyState(historyKey());
+    if (!state.ready || state.loading || state.acknowledging) return;
+    const candidates = messages.value.filter(
+      (event) =>
+        event.recipient &&
+        peerOf(event)?.id === selected.id &&
+        (!state.hasNewer || event.seq <= state.forwardSeq),
+    );
+    const last = candidates.reduce(
+      (a, b) => (!a || b.seq > a.seq ? b : a),
+      null,
+    );
+    if (!last || last.seq <= state.ackSeq) return;
+    const version = generation;
+    state.acknowledging = true;
+    try {
+      const response = await fetch(
+        `/api/conversations/${encodeURIComponent(selected.id)}/read`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ through: last.id }),
+        },
+      );
+      if (response.ok && version === generation) state.ackSeq = last.seq;
+    } catch {
+      /* A later visit or visibility change retries the acknowledgement. */
+    } finally {
+      state.acknowledging = false;
+      if (version === generation && state.ackSeq === last.seq)
+        nextTick(acknowledge);
+    }
+  }
+  watch(
+    () => [messages.value.length, activePeer.value?.id],
+    async () => {
+      await nextTick();
+      acknowledge();
+    },
+    { flush: "post" },
+  );
+  async function lookupUser(username) {
+    const version = generation;
+    error.value = "";
+    try {
+      const response = await fetch(
+        `/api/users/lookup?username=${encodeURIComponent(username.trim())}`,
+        {
+          headers: { Authorization: `Bearer ${token}` },
+        },
+      );
+      const body = await readJson(response);
+      if (version !== generation) return false;
+      if (!response.ok) {
+        error.value = detail(body, "查找失败");
+        return false;
+      }
+      openPrivate(body.user);
+      return true;
+    } catch {
+      if (version === generation) error.value = "查找失败，请重试";
+      return false;
     }
   }
   function connect() {
@@ -149,8 +275,21 @@ export function useChat() {
         history.value = {};
         syncHistoryState();
         fetchHistory();
+        current.send(JSON.stringify({ type: "subscribe_inbox" }));
       } else if (event.type === "users") users.value = event.users;
-      else if (
+      else if (event.type === "conversations") {
+        conversations.value = event.items;
+        unread.value = Object.fromEntries(
+          event.items.map((item) => [item.peer.id, item.unread]),
+        );
+      } else if (event.type === "file_state") {
+        fileStates.set(event.file.id, event.file);
+        messages.value = messages.value.map((message) =>
+          message.file?.id === event.file.id
+            ? { ...message, file: event.file }
+            : message,
+        );
+      } else if (
         event.type === "chat" ||
         event.type === "notice" ||
         event.type === "private" ||
@@ -159,17 +298,15 @@ export function useChat() {
         const duplicate =
           event.id && messages.value.some((message) => message.id === event.id);
         if (!duplicate) {
+          if (event.file && fileStates.has(event.file.id))
+            event.file = fileStates.get(event.file.id);
           messages.value.push(event);
-          if (messages.value.length > 500) messages.value.shift();
         }
-        if (event.recipient && event.sender.id !== user.value?.id) {
-          const peer = peerOf(event);
-          if (peer && peer.id !== activePeer.value?.id)
-            unread.value = {
-              ...unread.value,
-              [peer.id]: (unread.value[peer.id] || 0) + 1,
-            };
-        }
+        if (
+          (event.type === "private" || event.type === "file") &&
+          event.sender.id === user.value?.id
+        )
+          info.value = event.queued ? "对方离线，消息已保存" : "";
       } else if (event.type === "error") {
         error.value = event.message;
         if (!user.value) {
@@ -288,14 +425,15 @@ export function useChat() {
       userId: person.user_id,
       nickname: person.nickname,
     };
-    unread.value = { ...unread.value, [person.id]: 0 };
+    info.value = "";
     syncHistoryState();
-    fetchHistory();
+    if (!historyState(historyKey()).ready) fetchHistory();
+    else nextTick(acknowledge);
   }
   function closePrivate() {
     activePeer.value = null;
     syncHistoryState();
-    fetchHistory();
+    if (!historyState(historyKey()).ready) fetchHistory();
   }
   function writable() {
     if (status.value !== "connected" || socket?.readyState !== WebSocket.OPEN) {
@@ -306,6 +444,7 @@ export function useChat() {
   }
   function validate(text) {
     error.value = "";
+    info.value = "";
     const body = text.trim();
     if ([...body].length < 1 || [...body].length > 2000) {
       error.value = "消息须为1～2000个字符";
@@ -353,10 +492,6 @@ export function useChat() {
       return;
     }
     const target = activePeer.value ? { ...activePeer.value } : null;
-    if (target && !users.value.some((person) => person.id === target.id)) {
-      error.value = "对方不在线，无法发送文件";
-      return;
-    }
     const state = {
       name: file.name,
       target: target?.nickname || "公共频道",
@@ -403,15 +538,56 @@ export function useChat() {
       }
     }
   }
+  async function removeFile(file) {
+    if (!writable() || !token || deleting.value[file.id]) return;
+    if (
+      !window.confirm(
+        `删除“${file.name}”？文件内容将被移除，聊天卡片仍会保留。`,
+      )
+    )
+      return;
+    const version = generation;
+    deleting.value = { ...deleting.value, [file.id]: true };
+    error.value = "";
+    try {
+      const response = await fetch(
+        `/api/files/${encodeURIComponent(file.id)}`,
+        {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${token}` },
+        },
+      );
+      if (!response.ok) {
+        const body = await readJson(response);
+        throw new Error(detail(body, "删除失败，请重试"));
+      }
+      if (version === generation)
+        messages.value = messages.value.map((message) =>
+          message.file?.id === file.id
+            ? { ...message, file: { ...message.file, status: "deleted" } }
+            : message,
+        );
+    } catch (cause) {
+      if (version === generation) error.value = cause.message;
+    } finally {
+      if (version === generation) {
+        const remaining = { ...deleting.value };
+        delete remaining[file.id];
+        deleting.value = remaining;
+      }
+    }
+  }
   function syncSession(event) {
     if (event.storageArea !== localStorage) return;
     if (event.key !== TOKEN_KEY && event.key !== null) return;
     if (localStorage.getItem(TOKEN_KEY) !== token) restore();
   }
   window.addEventListener("storage", syncSession);
+  document.addEventListener("visibilitychange", acknowledge);
   onBeforeUnmount(() => {
     restoring++;
     window.removeEventListener("storage", syncSession);
+    document.removeEventListener("visibilitychange", acknowledge);
     disconnect();
   });
   return {
@@ -423,12 +599,19 @@ export function useChat() {
     error,
     activePeer,
     unread,
+    conversations,
+    lookupUser,
+    hasNewer,
+    info,
     upload,
     downloading,
+    deleting,
+    removeFile,
     historyLoading,
     hasMoreHistory,
     fetchHistory,
-    loadMoreHistory: fetchHistory,
+    loadMoreHistory: () => fetchHistory("older"),
+    loadNewer: () => fetchHistory("newer"),
     login,
     register,
     logout,
