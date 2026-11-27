@@ -63,6 +63,7 @@ async function startPrivate() {
 const labels = {
   idle: "未连接",
   connecting: "连接中",
+  reconnecting: "正在重连",
   connected: "已连接",
   disconnected: "连接已断开",
 };
@@ -88,6 +89,12 @@ function selectFile(event) {
 }
 const visibleMessages = computed(() => {
   if (!user.value) return [];
+  const order = new Map();
+  let running = 0;
+  for (const message of messages.value) {
+    if (message.seq) running = message.seq;
+    order.set(message, message.seq ?? running);
+  }
   return messages.value
     .filter((message) => {
       if (!activePeer.value) return !message.recipient;
@@ -98,7 +105,7 @@ const visibleMessages = computed(() => {
           : message.sender;
       return peer.user_id === activePeer.value.userId;
     })
-    .sort((a, b) => (a.seq || 0) - (b.seq || 0));
+    .sort((a, b) => (order.get(a) || 0) - (order.get(b) || 0));
 });
 const peerOnline = computed(
   () =>
@@ -319,13 +326,15 @@ async function leave() {
           {{ historyLoading ? "正在加载…" : "加载后续消息" }}
         </button>
         <div
-          v-if="status === 'disconnected'"
+          v-if="status === 'disconnected' || status === 'reconnecting'"
           class="disconnect-banner"
           role="status"
         >
-          连接已断开，重新进入后可继续聊天。<button @click="connect">
-            重新进入
-          </button>
+          {{
+            status === "reconnecting"
+              ? "连接已断开，正在自动重连…"
+              : "连接已断开，正在等待重连…"
+          }}<button @click="connect">立即重连</button>
         </div>
         <form class="composer" @submit.prevent="submit">
           <p v-if="error" class="error" role="alert">{{ error }}</p>
