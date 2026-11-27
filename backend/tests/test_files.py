@@ -250,7 +250,7 @@ def test_sender_leaves_during_upload(client):
     with client.websocket_connect("/ws") as ws:
         user, headers = enter(client, ws, "测试员")
         async def receive():
-            await client.app.state.room.remove(client.app.state.room.peers[user["id"]])
+            await client.app.state.room.remove(client.app.state.room.connections(user["user_id"])[0])
             return {"type": "http.request", "body": b"complete", "more_body": False}
         assert client.portal.call(asgi_upload, client.app, headers, receive) == 401
         assert_clean(client)
@@ -265,7 +265,7 @@ def test_target_leaves_during_upload(client):
         from starlette.requests import Request
         original = Request.stream
         async def interleaved(request):
-            await request.app.state.room.remove(request.app.state.room.peers[target["id"]])
+            await request.app.state.room.remove(request.app.state.room.connections(target["user_id"])[0])
             async for chunk in original(request):
                 yield chunk
         with patch.object(Request, "stream", interleaved):
