@@ -14,7 +14,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.db import AuthError, Database
+from backend.db import AuthError, Database, token_hash
 from backend.files import FileStore, MAX_FILE_SIZE, STORAGE_LIMIT, router as files_router
 
 
@@ -37,10 +37,11 @@ class Peer:
     username: str
     display_name: str
     id: str = field(default_factory=lambda: str(uuid4()))
+    session_hash: str | None = field(default=None, repr=False)
 
     def public(self):
         return {
-            "id": self.id,
+            "id": self.user_id,
             "user_id": self.user_id,
             "username": self.username,
             "nickname": self.display_name,
@@ -52,6 +53,22 @@ class ChatRoom:
         self.peers: dict[str, Peer] = {}
         # Serialize room changes and broadcasts to preserve event order.
         self.lock = asyncio.Lock()
+
+    def connections(self, user_id):
+        return [peer for peer in self.peers.values() if peer.user_id == user_id]
+
+    async def discard(self, peers, close_code=1000):
+        """Called under lock. Presence belongs to accounts, not individual sockets."""
+        removed = [self.peers.pop(peer.id) for peer in peers if peer.id in self.peers]
+        for peer in removed:
+            try:
+                await asyncio.wait_for(peer.socket.close(code=close_code), timeout=3)
+            except Exception:
+                pass
+        offline = {peer.user_id: peer for peer in removed if not self.connections(peer.user_id)}
+        if not offline:
+            return []
+        return [self.users_event(), *[self.notice(peer, "离开") for peer in offline.values()]]
 
     async def send(self, socket, event):
         try:
@@ -68,35 +85,20 @@ class ChatRoom:
                 for peer in list(self.peers.values()):
                     if peer.id not in failed and not await self.send(peer.socket, event):
                         failed.add(peer.id)
-            removed = [self.peers.pop(uid) for uid in failed if uid in self.peers]
-            events = []
-            if removed:
-                for peer in removed:
-                    try:
-                        await asyncio.wait_for(peer.socket.close(), timeout=3)
-                    except Exception:
-                        pass
-                events = [self.users_event(), *[self.notice(p, "离开") for p in removed]]
+            events = await self.discard([self.peers[uid] for uid in failed if uid in self.peers])
 
     async def deliver(self, recipients, event):
-        """Called under lock. Send one event to selected peers, cleaning up failures."""
+        """Send once to every connection of the selected accounts, under lock."""
+        account_ids = {peer.user_id for peer in recipients}
         failed = [
-            peer for peer in recipients if not await self.send(peer.socket, event)
+            peer for peer in list(self.peers.values())
+            if peer.user_id in account_ids and not await self.send(peer.socket, event)
         ]
-        removed = [self.peers.pop(peer.id) for peer in failed if peer.id in self.peers]
-        if not removed:
-            return
-        for peer in removed:
-            try:
-                await asyncio.wait_for(peer.socket.close(), timeout=3)
-            except Exception:
-                pass
-        await self.publish(
-            [self.users_event(), *[self.notice(peer, "离开") for peer in removed]]
-        )
+        await self.publish(await self.discard(failed))
 
     def users_event(self):
-        return {"type": "users", "users": [p.public() for p in self.peers.values()]}
+        accounts = {peer.user_id: peer.public() for peer in self.peers.values()}
+        return {"type": "users", "users": list(accounts.values())}
 
     def notice(self, peer, action):
         return {
@@ -108,7 +110,8 @@ class ChatRoom:
     async def remove(self, peer):
         async with self.lock:
             if self.peers.pop(peer.id, None):
-                await self.publish([self.users_event(), self.notice(peer, "离开")])
+                if not self.connections(peer.user_id):
+                    await self.publish([self.users_event(), self.notice(peer, "离开")])
 
 
 def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path=None):
@@ -177,6 +180,9 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path
         token = bearer_token(request)
         if token is not None:
             await asyncio.to_thread(app.state.db.delete_session, token)
+            async with room.lock:
+                affected = [peer for peer in room.peers.values() if peer.session_hash == token_hash(token)]
+                await room.publish(await room.discard(affected, close_code=4001))
 
     @app.get("/api/auth/me")
     async def me(request: Request):
@@ -232,20 +238,28 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path
                         if account is None:
                             raise ValueError("登录已过期，请重新登录")
                         async with room.lock:
+                            # A logout could have revoked the session while auth waited for the lock.
+                            account = await asyncio.to_thread(app.state.db.session_user, token)
+                            if account is None:
+                                raise ValueError("登录已过期，请重新登录")
+                            already_online = bool(room.connections(account["id"]))
                             peer = Peer(
                                 socket,
                                 account["id"],
                                 account["username"],
                                 account["display_name"],
+                                session_hash=token_hash(token),
                             )
                             room.peers[peer.id] = peer
                             welcome = {"type": "welcome", "user": peer.public()}
                             if not await room.send(socket, welcome):
                                 room.peers.pop(peer.id, None)
                                 break
-                            await room.publish(
-                                [room.users_event(), room.notice(peer, "进入")]
-                            )
+                            if already_online:
+                                if not await room.send(socket, room.users_event()):
+                                    break
+                            else:
+                                await room.publish([room.users_event(), room.notice(peer, "进入")])
                     elif kind == "chat":
                         if not peer or peer.id not in room.peers:
                             raise ValueError("请先登录")
@@ -253,6 +267,8 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path
                         if not isinstance(text, str) or not 1 <= len(text.strip()) <= 2000:
                             raise ValueError("消息须为1～2000个字符")
                         async with room.lock:
+                            if peer.id not in room.peers:
+                                raise ValueError("请重新登录")
                             message_id = str(uuid4())
                             created = timestamp()
                             await room.publish([{
@@ -284,10 +300,13 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path
                         if not isinstance(target_id, str) or not target_id:
                             raise ValueError("请选择私聊对象")
                         async with room.lock:
-                            target = room.peers.get(target_id)
-                            if target is None:
+                            if peer.id not in room.peers:
+                                raise ValueError("请重新登录")
+                            targets = room.connections(target_id)
+                            if not targets:
                                 raise ValueError("对方不在线，无法发送私聊")
-                            if target.id == peer.id:
+                            target = targets[0]
+                            if target.user_id == peer.user_id:
                                 raise ValueError("不能给自己发送私聊")
                             message_id = str(uuid4())
                             created = timestamp()

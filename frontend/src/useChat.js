@@ -20,6 +20,8 @@ export function useChat() {
   let socket = null;
   let timer = null;
   let token = null;
+  let generation = 0;
+  let restoring = 0;
   let pendingUpload = null;
   const downloads = new Set();
   function saveToken(value) {
@@ -56,6 +58,7 @@ export function useChat() {
     hasMoreHistory.value = true;
   }
   function disconnect() {
+    generation++;
     stopTransfers();
     clearTimeout(timer);
     const previous = socket;
@@ -82,6 +85,7 @@ export function useChat() {
   async function fetchHistory() {
     if (!token || status.value !== "connected" || historyLoading.value) return;
     const key = historyKey();
+    const requestGeneration = generation;
     const state = historyState(key);
     if (!state.hasMore) return;
     historyLoading.value = true;
@@ -97,17 +101,18 @@ export function useChat() {
       });
       if (!response.ok) return;
       const body = await response.json();
+      if (generation !== requestGeneration) return;
       const incoming = Array.isArray(body.messages) ? body.messages : [];
       const seen = new Set(messages.value.map((message) => message.id));
       const fresh = incoming.filter((message) => !seen.has(message.id));
       if (fresh.length) messages.value = [...fresh, ...messages.value];
       if (incoming.length) state.cursor = incoming[0].id;
       state.hasMore = Boolean(body.has_more);
-      hasMoreHistory.value = state.hasMore;
+      syncHistoryState();
     } catch {
       /* 网络失败时保留当前状态，再次上滑可重试 */
     } finally {
-      historyLoading.value = false;
+      if (generation === requestGeneration) historyLoading.value = false;
     }
   }
   function connect() {
@@ -179,8 +184,13 @@ export function useChat() {
       if (socket === current)
         error.value = "无法连接服务器，请检查服务是否启动";
     };
-    current.onclose = () => {
+    current.onclose = ({ code }) => {
       if (socket !== current) return;
+      if (code === 4001) {
+        disconnect();
+        clearSession();
+        return;
+      }
       stopTransfers();
       clearTimeout(timer);
       status.value = "disconnected";
@@ -198,6 +208,7 @@ export function useChat() {
     return typeof body.detail === "string" ? body.detail : fallback;
   }
   async function login(username, password) {
+    const attempt = ++restoring;
     error.value = "";
     const response = await fetch("/api/auth/login", {
       method: "POST",
@@ -205,6 +216,7 @@ export function useChat() {
       body: JSON.stringify({ username, password }),
     });
     const body = await readJson(response);
+    if (attempt !== restoring) return false;
     if (!response.ok) {
       error.value = detail(body, "登录失败，请稍后重试");
       return false;
@@ -229,6 +241,7 @@ export function useChat() {
     return login(username, password);
   }
   async function logout() {
+    restoring++;
     const current = token;
     disconnect();
     clearSession();
@@ -245,18 +258,25 @@ export function useChat() {
     }
   }
   async function restore() {
+    const attempt = ++restoring;
     const saved = localStorage.getItem(TOKEN_KEY);
-    if (!saved) return;
+    disconnect();
     token = saved;
+    account.value = null;
+    if (!saved) return;
     try {
       const response = await fetch("/api/auth/me", {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!response.ok) throw new Error("expired");
       const body = await response.json();
+      if (attempt !== restoring || localStorage.getItem(TOKEN_KEY) !== saved)
+        return;
       account.value = body.user;
       connect();
     } catch {
+      if (attempt !== restoring || localStorage.getItem(TOKEN_KEY) !== saved)
+        return;
       saveToken(null);
       account.value = null;
     }
@@ -383,7 +403,17 @@ export function useChat() {
       }
     }
   }
-  onBeforeUnmount(disconnect);
+  function syncSession(event) {
+    if (event.storageArea !== localStorage) return;
+    if (event.key !== TOKEN_KEY && event.key !== null) return;
+    if (localStorage.getItem(TOKEN_KEY) !== token) restore();
+  }
+  window.addEventListener("storage", syncSession);
+  onBeforeUnmount(() => {
+    restoring++;
+    window.removeEventListener("storage", syncSession);
+    disconnect();
+  });
   return {
     status,
     account,

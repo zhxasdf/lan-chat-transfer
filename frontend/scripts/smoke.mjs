@@ -188,13 +188,11 @@ try {
   // Real HTTP upload, WebSocket file notification and browser download.
   await a.getByRole("button", { name: "公共频道" }).click();
   const publicBytes = Buffer.from("群聊文件内容\nhello file 🙂\n");
-  await b
-    .getByLabel("选择文件")
-    .setInputFiles({
-      name: "课程资料.txt",
-      mimeType: "text/plain",
-      buffer: publicBytes,
-    });
+  await b.getByLabel("选择文件").setInputFiles({
+    name: "课程资料.txt",
+    mimeType: "text/plain",
+    buffer: publicBytes,
+  });
   for (const page of [a, b, c])
     await until(
       async () => (await page.locator(".file-card").count()) === 1,
@@ -229,13 +227,11 @@ try {
     },
     { times: 1 },
   );
-  await a
-    .getByLabel("选择文件")
-    .setInputFiles({
-      name: "私聊资料.bin",
-      mimeType: "application/octet-stream",
-      buffer: privateBytes,
-    });
+  await a.getByLabel("选择文件").setInputFiles({
+    name: "私聊资料.bin",
+    mimeType: "application/octet-stream",
+    buffer: privateBytes,
+  });
   await ready;
   await a.getByRole("button", { name: "公共频道" }).click();
   finishUpload();
@@ -263,24 +259,18 @@ try {
   const privatePath = path.join(downloadDirectory, "private.bin");
   await (await privateDownloadEvent).saveAs(privatePath);
   assert.equal(digest(await readFile(privatePath)), digest(privateBytes));
-  const unauthorized = await api.get(
-    `${url}/api/files/${privateId}`,
-    { headers: { Authorization: `Bearer ${await tokenOf(c)}` } },
-  );
+  const unauthorized = await api.get(`${url}/api/files/${privateId}`, {
+    headers: { Authorization: `Bearer ${await tokenOf(c)}` },
+  });
   assert.equal(unauthorized.status(), 403);
-  assert.equal(
-    (await api.get(`${url}/api/files/${publicId}`)).status(),
-    401,
-  );
+  assert.equal((await api.get(`${url}/api/files/${publicId}`)).status(), 401);
 
   // Oversized selection is rejected before an HTTP transfer is started.
-  await a
-    .getByLabel("选择文件")
-    .setInputFiles({
-      name: "too-large.bin",
-      mimeType: "application/octet-stream",
-      buffer: Buffer.alloc(20 * 1024 * 1024 + 1),
-    });
+  await a.getByLabel("选择文件").setInputFiles({
+    name: "too-large.bin",
+    mimeType: "application/octet-stream",
+    buffer: Buffer.alloc(20 * 1024 * 1024 + 1),
+  });
   await until(
     async () => (await a.getByRole("alert").innerText()).includes("20 MiB"),
     "超限提示",
@@ -300,13 +290,11 @@ try {
     },
     { times: 1 },
   );
-  await a
-    .getByLabel("选择文件")
-    .setInputFiles({
-      name: "cancelled.txt",
-      mimeType: "text/plain",
-      buffer: Buffer.from("cancel me"),
-    });
+  await a.getByLabel("选择文件").setInputFiles({
+    name: "cancelled.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("cancel me"),
+  });
   await cancelReady;
   await a.getByRole("button", { name: "取消上传" }).click();
   await heldRoute.abort().catch(() => {});
@@ -350,7 +338,10 @@ try {
   await duplicate.getByLabel("密码").fill(PASSWORD);
   await duplicate.getByRole("button", { name: /^注册并登录/ }).click();
   await duplicate.getByRole("alert").waitFor();
-  assert.match(await duplicate.getByRole("alert").innerText(), /用户名已被使用/);
+  assert.match(
+    await duplicate.getByRole("alert").innerText(),
+    /用户名已被使用/,
+  );
   await duplicate.close();
   await b.getByRole("button", { name: "退出", exact: true }).click();
   await b.getByLabel("用户名").waitFor();
@@ -379,9 +370,92 @@ try {
     headers: { Authorization: `Bearer ${await tokenOf(a)}` },
   });
   assert.equal(expired.status(), 404);
+  // Tabs in one browser share the login, but represent only one online account.
+  const sibling = await a.context().newPage();
+  sibling.on("pageerror", (error) => errors.push(error.message));
+  await sibling.goto(url);
+  await sibling.getByRole("button", { name: "退出", exact: true }).waitFor();
+  await until(
+    async () => (await sibling.locator(".user-list li").count()) === 1,
+    "同账号去重",
+  );
+  assert.equal(
+    await sibling.locator(".user-list button").first().isDisabled(),
+    true,
+  );
+  await login(b, "李四四");
+  await until(
+    async () => (await sibling.locator(".user-list li").count()) === 2,
+    "两账号在线",
+  );
+  const bSibling = await b.context().newPage();
+  bSibling.on("pageerror", (error) => errors.push(error.message));
+  await bSibling.goto(url);
+  await bSibling.getByRole("button", { name: "退出", exact: true }).waitFor();
+  await sibling.getByLabel("消息内容").fill("多标签群聊同步");
+  await sibling.getByRole("button", { name: /发送消息/ }).click();
+  for (const page of [a, sibling, b, bSibling]) {
+    await page
+      .locator(".bubble")
+      .filter({ hasText: "多标签群聊同步" })
+      .waitFor();
+    assert.equal(await page.locator(".user-list li").count(), 2);
+    await page
+      .getByRole("button", {
+        name:
+          page === a || page === sibling ? "与 李四四 私聊" : "与 张三三 私聊",
+      })
+      .click();
+  }
+  await sibling.getByLabel("消息内容").fill("多标签私聊同步");
+  await sibling.getByRole("button", { name: /发送消息/ }).click();
+  for (const page of [a, sibling, b, bSibling])
+    await page
+      .locator(".bubble")
+      .filter({ hasText: "多标签私聊同步" })
+      .waitFor();
+  await sibling
+    .getByLabel("选择文件")
+    .setInputFiles({
+      name: "tabs-sync.txt",
+      mimeType: "text/plain",
+      buffer: Buffer.from("tabs sync"),
+    });
+  for (const page of [a, sibling, b, bSibling])
+    await page
+      .locator(".file-card")
+      .filter({ hasText: "tabs-sync.txt" })
+      .waitFor();
+  await bSibling.close();
+  await a.close();
+  await sibling.getByLabel("消息内容").fill("关闭原标签仍可私聊");
+  await sibling.getByRole("button", { name: /发送消息/ }).click();
+  await b
+    .locator(".bubble")
+    .filter({ hasText: "关闭原标签仍可私聊" })
+    .waitFor();
+  assert.equal(await b.locator(".user-list li").count(), 2);
+  const another = await sibling.context().newPage();
+  await another.goto(url);
+  await another.getByRole("button", { name: "退出", exact: true }).waitFor();
+  await sibling.getByRole("button", { name: "退出", exact: true }).click();
+  await sibling.getByLabel("用户名").waitFor();
+  await another.getByLabel("用户名").waitFor();
+  await until(
+    async () => (await b.locator(".user-list li").count()) === 1,
+    "所有共享会话退出",
+  );
+  // Login changes also propagate to already-open tabs of the same browser.
+  await login(sibling, "王五五");
+  await another.getByRole("button", { name: "退出", exact: true }).waitFor();
+  await until(
+    async () => (await another.locator(".user-list li").count()) === 2,
+    "跨标签登录同步",
+  );
+  assert.equal(await tokenOf(sibling), await tokenOf(another));
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: 注册登录、群聊/私聊、文件上传下载与内容校验、第三人下载拒绝、上传切换会话、超限与取消、未读提示、退出清理、文本安全、窄屏、服务重启及文件失效。",
+    "PASS: 注册登录、群聊/私聊、文件上传下载与内容校验、第三人下载拒绝、上传切换会话、超限与取消、未读提示、退出清理、文本安全、窄屏、服务重启及文件失效；多标签账号去重、消息及文件同步、跨标签登录退出。",
   );
 } finally {
   await browser?.close();

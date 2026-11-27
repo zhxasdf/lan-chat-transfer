@@ -69,15 +69,16 @@ async def authenticated_user(request: Request):
 
 
 def online_peer(room, user_id):
-    return next((peer for peer in room.peers.values() if peer.user_id == user_id), None)
+    peers = room.connections(user_id)
+    return peers[0] if peers else None
 
 
 def target_peer(room, sender, target_id):
     if target_id is None:
         return None
-    if target_id == sender.id:
+    if target_id == sender.user_id:
         raise HTTPException(400, "不能给自己发送私聊文件")
-    target = room.peers.get(target_id)
+    target = online_peer(room, target_id)
     if target is None:
         raise HTTPException(409, "对方不在线，无法发送文件")
     return target
