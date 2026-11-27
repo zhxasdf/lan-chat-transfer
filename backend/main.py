@@ -182,6 +182,25 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path
     async def me(request: Request):
         return {"user": await current_account(request)}
 
+    @app.get("/api/history")
+    async def history(request: Request, kind: str = "public", peer: str | None = None,
+                      before: str | None = None, limit: int = 50):
+        account = await current_account(request)
+        limit = max(1, min(limit, 100))
+        if kind == "public":
+            messages, has_more = await asyncio.to_thread(
+                app.state.db.public_history, limit, before
+            )
+        elif kind == "private":
+            if not isinstance(peer, str) or not peer:
+                raise HTTPException(400, "请选择私聊对象")
+            messages, has_more = await asyncio.to_thread(
+                app.state.db.private_history, account["id"], peer, limit, before
+            )
+        else:
+            raise HTTPException(400, "未知的历史类型")
+        return {"messages": messages, "has_more": has_more}
+
     @app.websocket("/ws")
     async def websocket(socket: WebSocket):
         await socket.accept()
@@ -234,13 +253,27 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path
                         if not isinstance(text, str) or not 1 <= len(text.strip()) <= 2000:
                             raise ValueError("消息须为1～2000个字符")
                         async with room.lock:
+                            message_id = str(uuid4())
+                            created = timestamp()
                             await room.publish([{
                                 "type": "chat",
-                                "id": str(uuid4()),
+                                "id": message_id,
                                 "sender": peer.public(),
                                 "text": text.strip(),
-                                "time": timestamp(),
+                                "time": created,
                             }])
+                            await asyncio.to_thread(
+                                app.state.db.add_message,
+                                message_id,
+                                "public",
+                                peer.user_id,
+                                None,
+                                text.strip(),
+                                None,
+                                None,
+                                None,
+                                created,
+                            )
                     elif kind == "private":
                         if not peer or peer.id not in room.peers:
                             raise ValueError("请先登录")
@@ -256,14 +289,28 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path
                                 raise ValueError("对方不在线，无法发送私聊")
                             if target.id == peer.id:
                                 raise ValueError("不能给自己发送私聊")
+                            message_id = str(uuid4())
+                            created = timestamp()
                             await room.deliver([peer, target], {
                                 "type": "private",
-                                "id": str(uuid4()),
+                                "id": message_id,
                                 "sender": peer.public(),
                                 "recipient": target.public(),
                                 "text": text.strip(),
-                                "time": timestamp(),
+                                "time": created,
                             })
+                            await asyncio.to_thread(
+                                app.state.db.add_message,
+                                message_id,
+                                "private",
+                                peer.user_id,
+                                target.user_id,
+                                text.strip(),
+                                None,
+                                None,
+                                None,
+                                created,
+                            )
                     else:
                         raise ValueError("不支持的事件类型")
                 except (ValueError, TypeError) as exc:

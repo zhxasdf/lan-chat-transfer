@@ -144,6 +144,18 @@ async def upload_file(request: Request, filename: str = "file", to: str | None =
                 event["recipient"] = target.public()
             store.commit(record)
             committed = True
+            await asyncio.to_thread(
+                request.app.state.db.add_message,
+                event["id"],
+                "file",
+                current["id"],
+                target.user_id if target else None,
+                None,
+                file_id,
+                record.name,
+                size,
+                event["time"],
+            )
             if target:
                 await room.deliver([sender, target], event)
             else:

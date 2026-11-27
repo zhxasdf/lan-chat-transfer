@@ -425,6 +425,12 @@ p {
   margin: 20px 0;
   overflow-wrap: anywhere;
 }
+.history-status {
+  text-align: center;
+  font-size: 10px;
+  color: #9ba595;
+  margin: 12px 0;
+}
 .message {
   display: flex;
   gap: 10px;

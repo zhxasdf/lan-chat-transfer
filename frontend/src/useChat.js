@@ -13,7 +13,10 @@ export function useChat() {
     activePeer = ref(null),
     unread = ref({}),
     upload = ref(null),
-    downloading = ref({});
+    downloading = ref({}),
+    history = ref({}),
+    historyLoading = ref(false),
+    hasMoreHistory = ref(true);
   let socket = null;
   let timer = null;
   let token = null;
@@ -48,6 +51,9 @@ export function useChat() {
     messages.value = [];
     activePeer.value = null;
     unread.value = {};
+    history.value = {};
+    historyLoading.value = false;
+    hasMoreHistory.value = true;
   }
   function disconnect() {
     stopTransfers();
@@ -61,6 +67,48 @@ export function useChat() {
   function peerOf(event) {
     if (!user.value) return null;
     return event.sender.id === user.value.id ? event.recipient : event.sender;
+  }
+  function historyKey() {
+    return activePeer.value ? `private:${activePeer.value.userId}` : "public";
+  }
+  function historyState(key) {
+    if (!history.value[key])
+      history.value[key] = { cursor: null, hasMore: true };
+    return history.value[key];
+  }
+  function syncHistoryState() {
+    hasMoreHistory.value = historyState(historyKey()).hasMore;
+  }
+  async function fetchHistory() {
+    if (!token || status.value !== "connected" || historyLoading.value) return;
+    const key = historyKey();
+    const state = historyState(key);
+    if (!state.hasMore) return;
+    historyLoading.value = true;
+    try {
+      const params = new URLSearchParams({
+        kind: activePeer.value ? "private" : "public",
+        limit: "50",
+      });
+      if (activePeer.value) params.set("peer", activePeer.value.userId);
+      if (state.cursor) params.set("before", state.cursor);
+      const response = await fetch(`/api/history?${params}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) return;
+      const body = await response.json();
+      const incoming = Array.isArray(body.messages) ? body.messages : [];
+      const seen = new Set(messages.value.map((message) => message.id));
+      const fresh = incoming.filter((message) => !seen.has(message.id));
+      if (fresh.length) messages.value = [...fresh, ...messages.value];
+      if (incoming.length) state.cursor = incoming[0].id;
+      state.hasMore = Boolean(body.has_more);
+      hasMoreHistory.value = state.hasMore;
+    } catch {
+      /* 网络失败时保留当前状态，再次上滑可重试 */
+    } finally {
+      historyLoading.value = false;
+    }
   }
   function connect() {
     if (!token) return;
@@ -93,6 +141,9 @@ export function useChat() {
         clearTimeout(timer);
         user.value = event.user;
         status.value = "connected";
+        history.value = {};
+        syncHistoryState();
+        fetchHistory();
       } else if (event.type === "users") users.value = event.users;
       else if (
         event.type === "chat" ||
@@ -100,8 +151,12 @@ export function useChat() {
         event.type === "private" ||
         event.type === "file"
       ) {
-        messages.value.push(event);
-        if (messages.value.length > 500) messages.value.shift();
+        const duplicate =
+          event.id && messages.value.some((message) => message.id === event.id);
+        if (!duplicate) {
+          messages.value.push(event);
+          if (messages.value.length > 500) messages.value.shift();
+        }
         if (event.recipient && event.sender.id !== user.value?.id) {
           const peer = peerOf(event);
           if (peer && peer.id !== activePeer.value?.id)
@@ -208,11 +263,19 @@ export function useChat() {
   }
   function openPrivate(person) {
     if (!user.value || !person || person.id === user.value.id) return;
-    activePeer.value = { id: person.id, nickname: person.nickname };
+    activePeer.value = {
+      id: person.id,
+      userId: person.user_id,
+      nickname: person.nickname,
+    };
     unread.value = { ...unread.value, [person.id]: 0 };
+    syncHistoryState();
+    fetchHistory();
   }
   function closePrivate() {
     activePeer.value = null;
+    syncHistoryState();
+    fetchHistory();
   }
   function writable() {
     if (status.value !== "connected" || socket?.readyState !== WebSocket.OPEN) {
@@ -332,6 +395,10 @@ export function useChat() {
     unread,
     upload,
     downloading,
+    historyLoading,
+    hasMoreHistory,
+    fetchHistory,
+    loadMoreHistory: fetchHistory,
     login,
     register,
     logout,

@@ -4,17 +4,25 @@ import { formatSize } from "../fileTransfer";
 const props = defineProps({
   messages: Array,
   selfId: String,
+  selfUserId: String,
   privatePeer: Object,
   downloading: Object,
   connected: Boolean,
+  historyLoading: Boolean,
+  hasMore: Boolean,
 });
-defineEmits(["download"]);
+const emit = defineEmits(["download", "loadmore"]);
 const list = ref(null);
 function time(value) {
   return new Date(value).toLocaleTimeString("zh-CN", {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+function onScroll() {
+  const element = list.value;
+  if (!element || props.historyLoading || !props.hasMore) return;
+  if (element.scrollTop < 40) emit("loadmore");
 }
 watch(
   () =>
@@ -29,6 +37,16 @@ watch(
       list.value.scrollTop = list.value.scrollHeight;
   },
 );
+watch(
+  () => props.messages[0]?.id,
+  async (next, previous) => {
+    const element = list.value;
+    if (!element || !previous || next === previous) return;
+    const before = element.scrollHeight;
+    await nextTick();
+    if (list.value) list.value.scrollTop += list.value.scrollHeight - before;
+  },
+);
 </script>
 <template>
   <div
@@ -37,6 +55,7 @@ watch(
     role="log"
     aria-label="聊天消息"
     aria-live="polite"
+    @scroll="onScroll"
   >
     <div class="channel-intro">
       <span>{{ privatePeer ? "@" : "#" }}</span>
@@ -55,6 +74,9 @@ watch(
         }}
       </p>
     </div>
+    <p v-if="historyLoading" class="history-status" role="status">
+      正在加载更早的消息…
+    </p>
     <template
       v-for="(message, index) in messages"
       :key="message.id || `notice-${index}`"
@@ -64,7 +86,7 @@ watch(
       <article
         v-else
         class="message"
-        :class="{ mine: message.sender.id === selfId }"
+        :class="{ mine: message.sender.user_id === selfUserId }"
       >
         <span class="avatar">{{ [...message.sender.nickname][0] }}</span>
         <div class="message-content">
