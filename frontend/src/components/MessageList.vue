@@ -7,11 +7,12 @@ const props = defineProps({
   selfUserId: String,
   privatePeer: Object,
   downloading: Object,
+  deleting: Object,
   connected: Boolean,
   historyLoading: Boolean,
   hasMore: Boolean,
 });
-const emit = defineEmits(["download", "loadmore"]);
+const emit = defineEmits(["download", "delete", "loadmore"]);
 const list = ref(null);
 function time(value) {
   return new Date(value).toLocaleTimeString("zh-CN", {
@@ -102,16 +103,41 @@ watch(
             <span class="file-icon" aria-hidden="true">▤</span>
             <div class="file-details">
               <strong class="file-name">{{ message.file.name }}</strong
-              ><span>{{ formatSize(message.file.size) }} · 临时文件</span>
+              ><span
+                >{{ formatSize(message.file.size) }} ·
+                {{
+                  message.file.status === "deleted"
+                    ? "文件已删除"
+                    : message.file.status === "missing"
+                      ? "文件不可用"
+                      : "已保存"
+                }}</span
+              >
             </div>
             <button
               type="button"
               class="file-download"
               :aria-label="`下载 ${message.file.name}`"
-              :disabled="!connected || downloading?.[message.file.id]"
+              :disabled="
+                !connected ||
+                downloading?.[message.file.id] ||
+                message.file.status !== 'available'
+              "
               @click="$emit('download', message.file)"
             >
               {{ downloading?.[message.file.id] ? "下载中…" : "下载" }}
+            </button>
+            <button
+              v-if="
+                message.sender.user_id === selfUserId &&
+                message.file.status !== 'deleted'
+              "
+              class="file-delete"
+              :aria-label="`删除 ${message.file.name}`"
+              :disabled="!connected || deleting?.[message.file.id]"
+              @click="$emit('delete', message.file)"
+            >
+              {{ deleting?.[message.file.id] ? "删除中…" : "删除" }}
             </button>
           </div>
           <div v-else class="bubble">{{ message.text }}</div>

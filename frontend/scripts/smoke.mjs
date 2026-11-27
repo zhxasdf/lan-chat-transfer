@@ -19,6 +19,7 @@ const python =
 const url = "http://127.0.0.1:8765";
 const PASSWORD = "password123";
 let server, browser;
+let stoppedOwnServer = false;
 let downloadDirectory;
 const errors = [];
 const digest = (value) => createHash("sha256").update(value).digest("hex");
@@ -32,11 +33,22 @@ async function until(check, label) {
 }
 async function start() {
   // Never accidentally test against, or terminate, someone else's server.
-  await new Promise((resolve, reject) => {
-    const probe = net.createServer();
-    probe.once("error", reject);
-    probe.listen(8765, "127.0.0.1", () => probe.close(resolve));
-  });
+  const portDeadline = Date.now() + (stoppedOwnServer ? 10000 : 0);
+  while (true) {
+    try {
+      await new Promise((resolve, reject) => {
+        const probe = net.createServer();
+        probe.once("error", reject);
+        probe.listen(8765, "127.0.0.1", () => probe.close(resolve));
+      });
+      break;
+    } catch (error) {
+      if (error.code !== "EADDRINUSE" || Date.now() >= portDeadline)
+        throw error;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+  stoppedOwnServer = false;
   server = spawn(
     python,
     [
@@ -58,7 +70,7 @@ async function start() {
         TEMP: downloadDirectory,
         TMPDIR: downloadDirectory,
         LAN_CHAT_DB: path.join(downloadDirectory, "chat.db"),
-        LAN_CHAT_TMP: downloadDirectory,
+        LAN_CHAT_FILES: path.join(downloadDirectory, "files"),
       },
     },
   );
@@ -82,6 +94,7 @@ async function stop() {
   const exited = new Promise((resolve) => server.once("exit", resolve));
   server.kill();
   await exited;
+  stoppedOwnServer = true;
 }
 function tokenOf(page) {
   return page.evaluate(() => localStorage.getItem("lan-chat-token"));
@@ -169,7 +182,7 @@ try {
     "私聊已发出",
   );
   await until(
-    async () => (await b.locator(".unread-badge").count()) === 1,
+    async () => (await b.locator(".user-list .unread-badge").count()) === 1,
     "李四四收到未读提示",
   );
   assert.equal(await c.locator(".bubble").count(), 3);
@@ -240,7 +253,7 @@ try {
     "上传完成",
   );
   await until(
-    async () => (await b.locator(".unread-badge").count()) === 1,
+    async () => (await b.locator(".user-list .unread-badge").count()) === 1,
     "私聊文件未读提示",
   );
   assert.equal(await a.locator(".file-card").count(), 1);
@@ -366,10 +379,16 @@ try {
     "重新进入后恢复历史",
   );
   assert.equal(await a.locator(".file-card").count(), 1);
-  const expired = await api.get(`${url}/api/files/${publicId}`, {
+  const persisted = await api.get(`${url}/api/files/${publicId}`, {
     headers: { Authorization: `Bearer ${await tokenOf(a)}` },
   });
-  assert.equal(expired.status(), 404);
+  assert.equal(persisted.status(), 200);
+  assert.equal(digest(await persisted.body()), digest(publicBytes));
+  const privatePersisted = await api.get(`${url}/api/files/${privateId}`, {
+    headers: { Authorization: `Bearer ${await tokenOf(a)}` },
+  });
+  assert.equal(privatePersisted.status(), 200);
+  assert.equal(digest(await privatePersisted.body()), digest(privateBytes));
   // Tabs in one browser share the login, but represent only one online account.
   const sibling = await a.context().newPage();
   sibling.on("pageerror", (error) => errors.push(error.message));
@@ -414,13 +433,11 @@ try {
       .locator(".bubble")
       .filter({ hasText: "多标签私聊同步" })
       .waitFor();
-  await sibling
-    .getByLabel("选择文件")
-    .setInputFiles({
-      name: "tabs-sync.txt",
-      mimeType: "text/plain",
-      buffer: Buffer.from("tabs sync"),
-    });
+  await sibling.getByLabel("选择文件").setInputFiles({
+    name: "tabs-sync.txt",
+    mimeType: "text/plain",
+    buffer: Buffer.from("tabs sync"),
+  });
   for (const page of [a, sibling, b, bSibling])
     await page
       .locator(".file-card")
@@ -453,9 +470,212 @@ try {
     "跨标签登录同步",
   );
   assert.equal(await tokenOf(sibling), await tokenOf(another));
+  // A registered offline account can receive text; unread state survives restart.
+  const sender = await newPage(),
+    receiver = await newPage();
+  await register(sender, "离线发送者");
+  await register(receiver, "离线接收者");
+  await receiver.getByRole("button", { name: "退出", exact: true }).click();
+  await receiver.getByLabel("用户名").waitFor();
+  await until(
+    async () =>
+      (await sender
+        .getByRole("button", { name: "与 离线接收者 私聊" })
+        .count()) === 0,
+    "接收者离线",
+  );
+  await sender.getByLabel("发起私聊").fill("离线接收者");
+  await sender.getByRole("button", { name: "查找账号", exact: true }).click();
+  await sender.getByRole("heading", { name: "与 离线接收者 私聊" }).waitFor();
+  assert.equal(
+    await sender.getByRole("button", { name: "＋ 发送文件" }).isDisabled(),
+    false,
+  );
+  await sender.getByLabel("消息内容").fill("离线留言-0");
+  await sender.getByLabel("消息内容").press("Enter");
+  await sender.getByText("对方离线，消息已保存", { exact: true }).waitFor();
+  await sender.locator(".bubble").filter({ hasText: "离线留言-0" }).waitFor();
+  const lookup = await api.get(
+    `${url}/api/users/lookup?username=${encodeURIComponent("离线接收者")}`,
+    {
+      headers: { Authorization: `Bearer ${await tokenOf(sender)}` },
+    },
+  );
+  const targetId = (await lookup.json()).user.id;
+  // Exercise real WebSocket delivery for a backlog larger than one history page.
+  await sender.evaluate(
+    ({ token, target }) =>
+      new Promise((resolve, reject) => {
+        const ws = new WebSocket(`ws://${location.host}/ws`);
+        const deadline = setTimeout(() => {
+          ws.close();
+          reject(new Error("backlog timeout"));
+        }, 15000);
+        let index = 1;
+        ws.onopen = () => ws.send(JSON.stringify({ type: "auth", token }));
+        ws.onerror = () => {
+          clearTimeout(deadline);
+          ws.close();
+          reject(new Error("backlog socket failed"));
+        };
+        ws.onmessage = ({ data }) => {
+          const event = JSON.parse(data);
+          if (event.type === "welcome" || event.type === "private") {
+            if (index === 55) {
+              clearTimeout(deadline);
+              ws.close();
+              resolve();
+            } else
+              ws.send(
+                JSON.stringify({
+                  type: "private",
+                  to: target,
+                  text: `离线留言-${index++}`,
+                }),
+              );
+          }
+        };
+      }),
+    { token: await tokenOf(sender), target: targetId },
+  );
+  const offlineBytes = Buffer.from("offline file survives restart\x00🙂");
+  await sender.getByLabel("选择文件").setInputFiles({
+    name: "offline-persist.bin",
+    mimeType: "application/octet-stream",
+    buffer: offlineBytes,
+  });
+  const offlineCard = sender
+    .locator(".file-card")
+    .filter({ hasText: "offline-persist.bin" });
+  await offlineCard.waitFor();
+  const offlineId = await offlineCard.getAttribute("data-file-id");
+  await stop();
+  await start();
+  await login(receiver, "离线接收者");
+  await until(
+    async () =>
+      (await receiver.locator(".recent-list .unread-badge").innerText()) ===
+      "56",
+    "重启后未读保留",
+  );
+  await receiver.reload();
+  await until(
+    async () =>
+      (await receiver.locator(".recent-list .unread-badge").innerText()) ===
+      "56",
+    "刷新不清未读",
+  );
+  const receiverTab = await receiver.context().newPage();
+  await receiverTab.goto(url);
+  await until(
+    async () =>
+      (await receiverTab.locator(".recent-list .unread-badge").innerText()) ===
+      "56",
+    "新标签未读一致",
+  );
+  await receiver.bringToFront();
+  await receiver
+    .getByRole("button", { name: "打开与 离线发送者 的会话" })
+    .click();
+  await until(
+    async () => (await receiver.locator(".bubble").count()) === 50,
+    "先显示最早50条未读",
+  );
+  assert.equal(
+    await receiver.locator(".bubble").first().innerText(),
+    "离线留言-0",
+  );
+  await until(
+    async () =>
+      (await receiverTab.locator(".recent-list .unread-badge").innerText()) ===
+      "6",
+    "未展示的5条文字和文件保留未读",
+  );
+  await receiver
+    .getByRole("button", { name: "加载后续消息", exact: true })
+    .click();
+  await until(
+    async () => (await receiver.locator(".bubble").count()) === 55,
+    "加载其余离线消息",
+  );
+  await until(
+    async () =>
+      (await receiverTab.locator(".recent-list .unread-badge").count()) === 0,
+    "跨标签已读同步",
+  );
+  const messageIds = await receiver.locator(".bubble").allTextContents();
+  assert.equal(new Set(messageIds).size, 55);
+  const receivedCard = receiver
+    .locator(".file-card")
+    .filter({ hasText: "offline-persist.bin" });
+  await receivedCard.waitFor();
+  const offlineDownload = receiver.waitForEvent("download");
+  await receivedCard
+    .getByRole("button", { name: "下载 offline-persist.bin" })
+    .click();
+  const offlinePath = path.join(downloadDirectory, "offline-received.bin");
+  await (await offlineDownload).saveAs(offlinePath);
+  assert.equal(digest(await readFile(offlinePath)), digest(offlineBytes));
+  assert.equal(
+    (
+      await api.get(`${url}/api/files/${offlineId}`, {
+        headers: { Authorization: `Bearer ${await tokenOf(b)}` },
+      })
+    ).status(),
+    403,
+  );
+  assert.equal(
+    (
+      await api.delete(`${url}/api/files/${offlineId}`, {
+        headers: { Authorization: `Bearer ${await tokenOf(receiver)}` },
+      })
+    ).status(),
+    403,
+  );
+  await sender.getByRole("button", { name: "重新进入" }).click();
+  await sender
+    .getByRole("button", { name: "打开与 离线接收者 的会话" })
+    .click();
+  await offlineCard.waitFor();
+  sender.once("dialog", (dialog) => dialog.accept());
+  await offlineCard
+    .getByRole("button", { name: "删除 offline-persist.bin" })
+    .click();
+  await until(
+    async () => (await receivedCard.innerText()).includes("文件已删除"),
+    "私聊删除状态同步",
+  );
+  assert.equal(
+    await receivedCard
+      .getByRole("button", { name: "下载 offline-persist.bin" })
+      .isDisabled(),
+    true,
+  );
+  assert.equal(
+    (
+      await api.get(`${url}/api/files/${offlineId}`, {
+        headers: { Authorization: `Bearer ${await tokenOf(receiver)}` },
+      })
+    ).status(),
+    404,
+  );
+  await receiver.reload();
+  await receiver.getByRole("button", { name: "退出", exact: true }).waitFor();
+  await until(
+    async () => (await receiver.locator(".recent-list button").count()) === 1,
+    "最近会话恢复",
+  );
+  assert.equal(await receiver.locator(".recent-list .unread-badge").count(), 0);
+  await receiver
+    .getByRole("button", { name: "打开与 离线发送者 的会话" })
+    .click();
+  await until(
+    async () => (await receivedCard.innerText()).includes("文件已删除"),
+    "刷新保留删除状态",
+  );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: 注册登录、群聊/私聊、文件上传下载与内容校验、第三人下载拒绝、上传切换会话、超限与取消、未读提示、退出清理、文本安全、窄屏、服务重启及文件失效；多标签账号去重、消息及文件同步、跨标签登录退出。",
+    "PASS: 原有聊天、账号和多标签页验证；离线文字及文件未读分页；公私文件重启后内容一致、离线文件上线下载、第三人拒绝、发送者删除及状态同步。",
   );
 } finally {
   await browser?.close();

@@ -121,7 +121,8 @@ def test_file_message_history(client):
         message = history["messages"][0]
         assert message["type"] == "file"
         assert message["id"] == event["id"]
-        assert message["file"] == {"id": file_id, "name": "资料.txt", "size": 5}
+        assert message["file"] == event["file"]
+        assert message["file"]["status"] == "available"
 
 
 def test_history_survives_restart(tmp_path):

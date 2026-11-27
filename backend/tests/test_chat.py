@@ -256,7 +256,8 @@ def test_private_chat_to_offline_user(client):
         assert len(a.receive_json()["users"]) == 1
         a.receive_json()
         a.send_json({"type": "private", "to": bob["id"], "text": "还在吗"})
-        assert "对方不在线" in a.receive_json()["message"]
+        saved = a.receive_json()
+        assert saved["type"] == "private" and saved["queued"] is True
         a.send_json({"type": "chat", "text": "仍在群聊"})
         assert a.receive_json()["text"] == "仍在群聊"
 

@@ -207,6 +207,77 @@ p {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  overflow: auto;
+}
+.inbox-panel {
+  flex: 1 0 180px;
+  min-height: 120px;
+}
+.lookup-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 18px;
+}
+.lookup-form label {
+  width: 100%;
+  font-size: 12px;
+  color: #315b42;
+}
+.lookup-form input {
+  width: 100%;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid #d2dfce;
+  border-radius: 6px;
+}
+.recent-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.recent-list button {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  width: 100%;
+  padding: 10px;
+  text-align: left;
+  color: #315b42;
+  background: transparent;
+  border-radius: 7px;
+}
+.recent-list button:hover,
+.recent-list button.active {
+  background: #dfe9d9;
+}
+.recent-name {
+  flex: 1;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+.recent-name small,
+.empty-inbox {
+  color: #66765f;
+  font-size: 10px;
+}
+.recent-preview {
+  width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #66765f;
+  font-size: 11px;
+}
+.load-newer {
+  padding: 10px;
+  color: #315b42;
+  background: #edf3e9;
+}
+.send-info {
+  font-size: 12px;
+  color: #315b42;
+  margin: 4px 0;
 }
 .room-title {
   display: flex;
@@ -707,6 +778,15 @@ p {
   border-radius: 7px;
   white-space: nowrap;
   font-size: 11px;
+}
+.file-delete {
+  background: transparent;
+  color: #934c42;
+  padding: 7px;
+  font-size: 11px;
+}
+.file-card {
+  flex-wrap: wrap;
 }
 .upload-status {
   display: flex;
