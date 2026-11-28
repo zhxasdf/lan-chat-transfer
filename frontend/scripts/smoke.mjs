@@ -23,8 +23,8 @@ let stoppedOwnServer = false;
 let downloadDirectory;
 const errors = [];
 const digest = (value) => createHash("sha256").update(value).digest("hex");
-async function until(check, label) {
-  const deadline = Date.now() + 10000;
+async function until(check, label, timeout = 10000) {
+  const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     if (await check()) return;
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -364,19 +364,20 @@ try {
   );
   await stop();
   await until(
-    async () => (await a.locator(".connection").innerText()) === "连接已断开",
+    async () => /重连|断开/.test(await a.locator(".connection").innerText()),
     "服务中断提示",
   );
   assert.equal(await a.getByLabel("消息内容").isDisabled(), true);
   await start();
-  await a.getByRole("button", { name: "重新进入" }).click();
   await until(
     async () => (await a.locator(".connection").innerText()) === "已连接",
-    "手动重新进入",
+    "自动重连",
+    30000,
   );
   await until(
-    async () => (await a.locator(".bubble").count()) === 3,
-    "重新进入后恢复历史",
+    async () => (await a.locator(".bubble").count()) >= 3,
+    "自动重连后恢复历史",
+    30000,
   );
   assert.equal(await a.locator(".file-card").count(), 1);
   const persisted = await api.get(`${url}/api/files/${publicId}`, {
@@ -632,7 +633,11 @@ try {
     ).status(),
     403,
   );
-  await sender.getByRole("button", { name: "重新进入" }).click();
+  await until(
+    async () => (await sender.locator(".connection").innerText()) === "已连接",
+    "离线测试自动重连",
+    30000,
+  );
   await sender
     .getByRole("button", { name: "打开与 离线接收者 的会话" })
     .click();
@@ -675,7 +680,7 @@ try {
   );
   assert.deepEqual(errors, []);
   console.log(
-    "PASS: 原有聊天、账号和多标签页验证；离线文字及文件未读分页；公私文件重启后内容一致、离线文件上线下载、第三人拒绝、发送者删除及状态同步。",
+    "PASS: 原有聊天、账号和多标签页验证；离线文字及文件未读分页；公私文件重启后内容一致、离线文件上线下载、第三人拒绝、发送者删除及状态同步；服务中断后自动重连并恢复历史。",
   );
 } finally {
   await browser?.close();

@@ -351,6 +351,29 @@ class Database:
         )
         return self._history(where, (), limit, before_id)
 
+    def public_after(self, after_id, limit=50):
+        """Catch-up page for reconnecting clients: public messages after a cursor."""
+        where = (
+            "((m.kind = 'public') OR (m.kind = 'file' AND m.recipient_user_id IS NULL))"
+            " AND m.seq > ?"
+        )
+        with self._read() as conn:
+            start = 0
+            if after_id:
+                cursor = conn.execute(
+                    "SELECT seq FROM messages WHERE id = ?", (after_id,)
+                ).fetchone()
+                if cursor is None:
+                    return [], False
+                start = cursor["seq"]
+            rows = conn.execute(
+                f"{self._MESSAGE_SELECT} WHERE {where} ORDER BY m.seq LIMIT ?",
+                (start, limit + 1),
+            ).fetchall()
+        has_newer = len(rows) > limit
+        events = [self._message_event(row) for row in rows[:limit]]
+        return events, has_newer
+
     def private_history(self, user_id, peer_user_id, limit=50, before_id=None):
         if not peer_user_id or peer_user_id == user_id:
             return [], False

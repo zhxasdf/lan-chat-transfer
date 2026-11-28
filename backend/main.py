@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,6 +40,7 @@ class Peer:
     id: str = field(default_factory=lambda: str(uuid4()))
     session_hash: str | None = field(default=None, repr=False)
     inbox: bool = False
+    last_seen: float = field(default_factory=time.monotonic, repr=False)
 
     def public(self):
         return {
@@ -57,6 +59,17 @@ class ChatRoom:
 
     def connections(self, user_id):
         return [peer for peer in self.peers.values() if peer.user_id == user_id]
+
+    async def sweep_stale(self, timeout):
+        """Close connections that stopped answering the application heartbeat."""
+        async with self.lock:
+            now = time.monotonic()
+            stale = [
+                peer for peer in self.peers.values()
+                if now - peer.last_seen > timeout
+            ]
+            if stale:
+                await self.publish(await self.discard(stale, close_code=4002))
 
     async def refresh_inbox(self, account_ids):
         """Called under room lock; subscriptions keep older clients compatible."""
@@ -133,7 +146,8 @@ class ChatRoom:
                     await self.publish([self.users_event(), self.notice(peer, "离开")])
 
 
-def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path=None, files_path=None):
+def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path=None, files_path=None,
+               heartbeat_interval=15.0, heartbeat_timeout=45.0):
     if db_path is None:
         db_path = os.environ.get("LAN_CHAT_DB")
     database_path = (
@@ -149,7 +163,24 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path
         directory = Path(files_path or os.environ.get("LAN_CHAT_FILES") or database_path.parent / "files")
         app.state.files = FileStore(directory, file_limit, storage_limit)
         await asyncio.to_thread(app.state.files.recover, app.state.db)
-        yield
+
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(heartbeat_interval)
+                try:
+                    await room.sweep_stale(heartbeat_timeout)
+                except Exception:
+                    pass
+
+        task = asyncio.create_task(heartbeat())
+        try:
+            yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     app = FastAPI(title="LAN Chat Transfer", lifespan=lifespan)
     room = ChatRoom()
@@ -243,9 +274,19 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path
         account = await current_account(request)
         limit = max(1, min(limit, 100))
         if kind == "public":
+            if after:
+                messages, has_newer = await asyncio.to_thread(
+                    app.state.db.public_after, after, limit
+                )
+                return {"messages": messages, "has_more": False,
+                        "has_newer": has_newer,
+                        "next_after": messages[-1]["id"] if messages else after}
             messages, has_more = await asyncio.to_thread(
                 app.state.db.public_history, limit, before
             )
+            return {"messages": messages, "has_more": has_more,
+                    "has_newer": False,
+                    "next_after": messages[-1]["id"] if messages else None}
         elif kind == "private":
             if not isinstance(peer, str) or not peer:
                 raise HTTPException(400, "请选择私聊对象")
@@ -272,6 +313,8 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path
                 incoming = await socket.receive()
                 if incoming["type"] == "websocket.disconnect":
                     break
+                if peer:
+                    peer.last_seen = time.monotonic()
                 raw = incoming.get("text")
                 try:
                     if raw is None:
@@ -316,6 +359,11 @@ def create_app(*, file_limit=MAX_FILE_SIZE, storage_limit=STORAGE_LIMIT, db_path
                                     break
                             else:
                                 await room.publish([room.users_event(), room.notice(peer, "进入")])
+                    elif kind == "ping":
+                        if not peer:
+                            raise ValueError("请先登录")
+                        if not await room.send(socket, {"type": "pong", "time": timestamp()}):
+                            break
                     elif kind == "subscribe_inbox":
                         async with room.lock:
                             if not peer or peer.id not in room.peers:

@@ -2,6 +2,9 @@ import { ref, watch, nextTick, onBeforeUnmount } from "vue";
 import { MAX_FILE_SIZE, uploadFile, downloadFile } from "./fileTransfer";
 
 const TOKEN_KEY = "lan-chat-token";
+const HEARTBEAT_INTERVAL = 20000;
+const HEARTBEAT_TIMEOUT = 55000;
+const RECONNECT_MAX_DELAY = 15000;
 
 export function useChat() {
   const status = ref("idle"),
@@ -26,9 +29,16 @@ export function useChat() {
   let token = null;
   let generation = 0;
   let restoring = 0;
+  let heartbeatTimer = null;
+  let reconnectTimer = null;
+  let reconnectAttempts = 0;
+  let lastActivity = 0;
+  let manualClose = true;
+  let resuming = false;
   let pendingUpload = null;
   const downloads = new Set();
   const fileStates = new Map();
+  const resumeMarkers = new Map();
   function saveToken(value) {
     token = value;
     if (value) localStorage.setItem(TOKEN_KEY, value);
@@ -68,6 +78,11 @@ export function useChat() {
     hasMoreHistory.value = true;
   }
   function disconnect() {
+    manualClose = true;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    reconnectAttempts = 0;
+    stopHeartbeat();
     generation++;
     stopTransfers();
     clearTimeout(timer);
@@ -76,6 +91,59 @@ export function useChat() {
     previous?.close();
     clearState();
     error.value = "";
+  }
+  function stopHeartbeat() {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+  function startHeartbeat() {
+    stopHeartbeat();
+    lastActivity = Date.now();
+    heartbeatTimer = setInterval(() => {
+      if (socket?.readyState !== WebSocket.OPEN) return;
+      if (Date.now() - lastActivity > HEARTBEAT_TIMEOUT) {
+        socket.close();
+        return;
+      }
+      try {
+        socket.send(JSON.stringify({ type: "ping" }));
+      } catch {
+        socket.close();
+      }
+    }, HEARTBEAT_INTERVAL);
+  }
+  function scheduleReconnect() {
+    if (reconnectTimer || manualClose || !token) return;
+    const delay = Math.min(500 * 2 ** reconnectAttempts, RECONNECT_MAX_DELAY);
+    reconnectAttempts += 1;
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      if (!token || manualClose) return;
+      connect({ resume: true });
+    }, delay);
+  }
+  function rememberResumeMarker() {
+    const selected = activePeer.value;
+    const last = [...messages.value].reverse().find((message) => {
+      if (!message.seq) return false;
+      if (!selected) return !message.recipient;
+      if (!message.recipient) return false;
+      return peerOf(message)?.id === selected.id;
+    });
+    if (last) resumeMarkers.set(historyKey(), last.id);
+  }
+  async function catchUp() {
+    const key = historyKey();
+    const marker = resumeMarkers.get(key);
+    if (!marker) return;
+    resumeMarkers.delete(key);
+    const state = historyState(key);
+    state.forward = marker;
+    state.hasNewer = true;
+    for (let page = 0; page < 20 && state.hasNewer; page += 1) {
+      await fetchHistory("newer");
+      if (state.loading) break;
+    }
   }
   function peerOf(event) {
     if (!user.value) return null;
@@ -147,8 +215,8 @@ export function useChat() {
         if (incoming.length) state.cursor = incoming[0].id;
         state.hasMore = Boolean(body.has_more);
       }
-      if (selected && (initial || direction === "newer")) {
-        state.forward = body.next_after;
+      if (initial || direction === "newer") {
+        if (body.next_after) state.forward = body.next_after;
         state.forwardSeq = incoming.at(-1)?.seq || state.forwardSeq;
         state.hasNewer = Boolean(body.has_newer);
       }
@@ -241,10 +309,22 @@ export function useChat() {
       return false;
     }
   }
-  function connect() {
+  function connect({ resume = false } = {}) {
     if (!token) return;
-    disconnect();
-    status.value = "connecting";
+    manualClose = false;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    stopHeartbeat();
+    clearTimeout(timer);
+    const previous = socket;
+    socket = null;
+    previous?.close();
+    if (!resume) {
+      stopTransfers();
+      clearState();
+    }
+    resuming = resume;
+    status.value = resume ? "reconnecting" : "connecting";
     const current = new WebSocket(
       `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`,
     );
@@ -262,6 +342,7 @@ export function useChat() {
     };
     current.onmessage = ({ data }) => {
       if (socket !== current) return;
+      lastActivity = Date.now();
       let event;
       try {
         event = JSON.parse(data);
@@ -272,10 +353,16 @@ export function useChat() {
         clearTimeout(timer);
         user.value = event.user;
         status.value = "connected";
+        const resumed = resuming;
+        resuming = false;
+        reconnectAttempts = 0;
+        info.value = "";
+        startHeartbeat();
         history.value = {};
         syncHistoryState();
         fetchHistory();
         current.send(JSON.stringify({ type: "subscribe_inbox" }));
+        if (resumed) catchUp();
       } else if (event.type === "users") users.value = event.users;
       else if (event.type === "conversations") {
         conversations.value = event.items;
@@ -323,15 +410,26 @@ export function useChat() {
     };
     current.onclose = ({ code }) => {
       if (socket !== current) return;
+      socket = null;
+      stopHeartbeat();
+      clearTimeout(timer);
       if (code === 4001) {
         disconnect();
         clearSession();
         return;
       }
+      if (manualClose) {
+        status.value = "disconnected";
+        users.value = [];
+        return;
+      }
+      rememberResumeMarker();
+      resuming = true;
       stopTransfers();
-      clearTimeout(timer);
-      status.value = "disconnected";
+      status.value = "reconnecting";
       users.value = [];
+      error.value = "";
+      scheduleReconnect();
     };
   }
   async function readJson(response) {
